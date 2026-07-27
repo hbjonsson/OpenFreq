@@ -1,5 +1,8 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37502.11 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenFreq.Testclient", "OpenFreq.Testclient\OpenFreq.Testclient.csproj", "{E4805528-5EE4-4B1F-8736-E4BE7EF540E3}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OpenFreq.Common", "OpenFreq.Common\OpenFreq.Common.csproj", "{FEBEC17C-50FE-42BA-B833-59E49886DA2D}"
@@ -125,5 +128,8 @@ Global
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {D42D41DB-2469-4C81-9B5E-B413A22CCC48}
 	EndGlobalSection
 EndGlobal
