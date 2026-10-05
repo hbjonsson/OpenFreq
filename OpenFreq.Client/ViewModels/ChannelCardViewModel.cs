@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Globalization;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -7,7 +6,6 @@ using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
 using FalconBmsDataService.Models;
 using OpenFreq.Client.Models;
-using OpenFreqAudio;
 using OpenFreqClient.Models;
 using OpenFreqClient.Services;
 using OpenFreqClient.Services.Interfaces;
@@ -85,13 +83,18 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
     public partial Channel.ChannelConnectionStatus ConnectionStatus { get; set; } =
         Channel.ChannelConnectionStatus.Disconnected;
 
+    /// <summary>Why the last join was refused, shown under the status pill. Null when there's nothing to show.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasConnectionError))]
+    public partial string? ConnectionError { get; set; }
+
+    public bool HasConnectionError => ConnectionError != null;
+
     [ObservableProperty]
     public partial Channel.ChannelTransmissionStatus TransmissionStatus { get; set; } =
         Channel.ChannelTransmissionStatus.Idle;
 
     [ObservableProperty] public partial bool IsEditing { get; set; }
-
-    [ObservableProperty] private bool _channelWasChanged;
 
     // Hotkey binding
     [ObservableProperty]
@@ -126,7 +129,7 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
     public void BmsLobby1Clicked()
     {
         Name = "BMS Lobby 1";
-        FrequencyKhz = 1234;
+        FrequencyKhz = 339750;
         PttHotKey = new KeyboardBinding(KeyCode.VcF1);
         ToggleEditing();
     }
@@ -135,13 +138,13 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
     public void BmsLobby2Clicked()
     {
         Name = "BMS Lobby 2";
-        FrequencyKhz = 339750;
+        FrequencyKhz = 1234;
         PttHotKey = new KeyboardBinding(KeyCode.VcF2);
         ToggleEditing();
     }
 
 
-    public ChannelCardViewModel(IOpenFreqService openFreqService, IHotkeyService hotkeyService, string name,
+    public ChannelCardViewModel(IHotkeyService hotkeyService, string name,
         int frequencyKhz, bool isInEditMode,
         RadioStationData radioStationData,
         LocationViewModel parentLocationViewModel, SettingsViewModel settings, bool isEditable = true,
@@ -178,17 +181,8 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
         }
         else
         {
-            // Exiting edit mode - send update if changed
-            var message = new ChannelUpdatedMessage(
-                Id,
-                _originalFrequencyKhz,
-                FrequencyKhz,
-                ConnectionStatus,
-                Pan,
-                _parentLocationViewModel.IsBmsLocation
-            );
-
-            WeakReferenceMessenger.Default.Send(message);
+            // Exiting edit mode - move the channel to its edited frequency
+            _parentLocationViewModel.RetuneChannelAsync(this, _originalFrequencyKhz).FireAndForget();
         }
 
         IsEditing = !IsEditing;
@@ -250,23 +244,9 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
     }
 
     [RelayCommand]
-    private void ClearPttHotkey()
-    {
-        if (PttHotKey == null) return;
-        _hotkeyService.UnregisterHotkey(IHotkeyService.HotkeyType.Ptt, PttHotKey, Id);
-        PttHotKey = null;
-    }
-
-    partial void OnFrequencyKhzChanged(int value)
-    {
-        _channelWasChanged = true;
-    }
-
-
-    [RelayCommand]
     public void DeleteChannel()
     {
-        WeakReferenceMessenger.Default.Send(new ChannelDeleteRequestedMessage(Id, FrequencyKhz));
+        _parentLocationViewModel.RemoveChannel(this);
     }
 
     public void StartTransmission()
@@ -278,10 +258,7 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
         if (Settings is { ModeIsGci: false, Is3dMode: true })
             return;
 
-        // mute only the transmitting frequency
-        var mutedFrequencies = new List<int> { FrequencyKhz };
-        WeakReferenceMessenger.Default.Send(new StartTransmissionMessage(Id, FrequencyKhz, RadioStationData,
-            mutedFrequencies));
+        WeakReferenceMessenger.Default.Send(new StartTransmissionMessage(Id, FrequencyKhz));
     }
 
     public void StopTransmission()
@@ -293,8 +270,11 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
         if (Settings is { ModeIsGci: false, Is3dMode: true })
             return;
 
-        WeakReferenceMessenger.Default.Send(new StopTransmissionMessage(Id, FrequencyKhz));
+        WeakReferenceMessenger.Default.Send(new StopTransmissionMessage(Id));
     }
+
+    // A refusal was for the old frequency. Joining the new one reports its own outcome.
+    partial void OnFrequencyKhzChanged(int value) => ConnectionError = null;
 
     partial void OnPanChanged(int value)
     {
@@ -304,28 +284,27 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
     [RelayCommand]
     public void ToggleJoinLeave()
     {
-        WeakReferenceMessenger.Default.Send(new ChannelJoinLeaveRequestedMessage(Id, FrequencyKhz,
-            ConnectionStatus != Channel.ChannelConnectionStatus.Connected, RadioStationData));
+        if (ConnectionStatus != Channel.ChannelConnectionStatus.Connected)
+            Join();
+        else
+            Leave();
     }
 
     public void Join()
     {
-        WeakReferenceMessenger.Default.Send(new ChannelJoinLeaveRequestedMessage(Id, FrequencyKhz,
-            true, RadioStationData));
+        _parentLocationViewModel.JoinChannelAsync(this).FireAndForget();
     }
 
     public void Leave()
     {
-        WeakReferenceMessenger.Default.Send(new ChannelJoinLeaveRequestedMessage(Id, FrequencyKhz,
-            false, RadioStationData));
+        _parentLocationViewModel.LeaveChannelAsync(this).FireAndForget();
     }
 
     [RelayCommand]
     public void ToggleSquelch()
     {
         IsSquelchEnabled = !IsSquelchEnabled;
-        WeakReferenceMessenger.Default.Send(new SquelchEnabledDisabledMessage(channelId: Id,
-            frequencyKhz: FrequencyKhz, squelchEnabled: IsSquelchEnabled));
+        _parentLocationViewModel.SetChannelSquelch(this);
     }
 
     public void Dispose()
@@ -338,70 +317,15 @@ public partial class ChannelCardViewModel : ViewModelBase, IDisposable
     }
 }
 
-public class ChannelUpdatedMessage(
-    Guid channelId,
-    int oldFrequencyKhz,
-    int newFrequencyKhz,
-    Channel.ChannelConnectionStatus oldConnectionStatus,
-    int currentPan,
-    bool isBmsChannel)
-{
-    public Guid ChannelId { get; } = channelId;
-    public int OldFrequencyKhz { get; } = oldFrequencyKhz;
-    public int NewFrequencyKhz { get; } = newFrequencyKhz;
-    public Channel.ChannelConnectionStatus OldConnectionStatus { get; } = oldConnectionStatus;
-    public bool IsBmsChannel { get; } = isBmsChannel;
-    public int CurrentPan { get; } = currentPan;
-
-    public bool NeedsReconnect => !IsBmsChannel &&
-                                  OldFrequencyKhz != NewFrequencyKhz &&
-                                  OldConnectionStatus == Channel.ChannelConnectionStatus.Connected;
-}
-
-public class ChannelJoinLeaveRequestedMessage(
-    Guid channelId,
-    int frequencyKhz,
-    bool join,
-    RadioStationData radioStationData)
-{
-    public Guid ChannelId { get; } = channelId;
-    public int FrequencyKhz { get; } = frequencyKhz;
-    public bool Join { get; } = join;
-    public RadioStationData RadioStationData { get; } = radioStationData;
-}
-
-public class SquelchEnabledDisabledMessage(
-    Guid channelId,
-    int frequencyKhz,
-    bool squelchEnabled)
-{
-    public Guid ChannelId { get; } = channelId;
-    public int FrequencyKhz { get; } = frequencyKhz;
-    public bool SquelchEnabled { get; } = squelchEnabled;
-}
-
-public class StartTransmissionMessage(
-    Guid channelId,
-    int frequencyKhz,
-    RadioStationData radioStationData,
-    List<int> mutedRadioChannels)
-{
-    public Guid ChannelId { get; } = channelId;
-    public int FrequencyKhz { get; } = frequencyKhz;
-    public RadioStationData RadioStationData { get; } = radioStationData;
-    public List<int> MutedRadioChannels { get; } = mutedRadioChannels;
-}
-
-public class StopTransmissionMessage(Guid channelId, int frequencyKhz)
+public class StartTransmissionMessage(Guid channelId, int frequencyKhz)
 {
     public Guid ChannelId { get; } = channelId;
     public int FrequencyKhz { get; } = frequencyKhz;
 }
 
-public class ChannelDeleteRequestedMessage(Guid channelId, int frequencyKhz)
+public class StopTransmissionMessage(Guid channelId)
 {
     public Guid ChannelId { get; } = channelId;
-    public int FrequencyKhz { get; } = frequencyKhz;
 }
 
 public class ChannelPanUpdateMessage(Guid channelId, int frequencyKhz, int pan)

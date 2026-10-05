@@ -37,13 +37,15 @@ public class AcmiClientService : IAcmiClientService
     private DateTime _referenceTime = DateTime.UnixEpoch;
     private double _relativeTime;
 
+    // _referenceTime keeps its value from an earlier connection, so this tells whether the current one sent it.
+    private bool _hasReferenceTime;
+
+    // In-game time of day in ticks, or -1 when unknown. Written by the receive task and read without a lock,
+    // because OpenFreqService can read it while holding its signalling lock.
+    private long _gameTimeOfDayTicks = -1;
+
     private readonly Lock _statusLock = new();
     private AcmiConnectionStatus _status = AcmiConnectionStatus.Disconnected;
-
-    // Track all encountered callsigns (objectId -> callsign)
-    private readonly ConcurrentDictionary<string, string> _allEncounteredCallsigns = new();
-    // Currently selected aircraft for tracking
-    private string? _selectedAircraftId;
 
     /// <summary>Fired when connection status changes</summary>
     public event EventHandler<AcmiConnectionEventArgs>? ConnectionStatusChanged;
@@ -66,12 +68,6 @@ public class AcmiClientService : IAcmiClientService
         if (!_trackedAircraft.TryRemove(objectId, out var aircraft)) return;
         _logger.LogInformation("Removed tracking for aircraft: {ObjectId} ({CallSign})",
             objectId, aircraft.CallSign);
-
-        // If this was the selected aircraft, clear selection
-        if (_selectedAircraftId == objectId)
-        {
-            _selectedAircraftId = null;
-        }
     }
 
     /// <summary>Current connection status</summary>
@@ -97,9 +93,6 @@ public class AcmiClientService : IAcmiClientService
             }
         }
     }
-
-    /// <summary>Read-only collection of currently tracked aircraft</summary>
-    public IReadOnlyDictionary<string, AcmiAircraft> TrackedAircraft => _trackedAircraft;
 
     public AcmiClientService(ILogger<AcmiClientService> logger)
     {
@@ -190,6 +183,7 @@ public class AcmiClientService : IAcmiClientService
 
         // Clear persistent buffer to avoid data leaking between connections
         _persistentBuffer.Clear();
+        ResetGameTime();
 
         Status = AcmiConnectionStatus.Disconnected;
         RaiseConnectionStatusChanged(AcmiConnectionStatus.Disconnected, "Disconnected");
@@ -204,70 +198,21 @@ public class AcmiClientService : IAcmiClientService
     /// <summary>Gets all aircraft currently tracked</summary>
     public IEnumerable<AcmiAircraft> GetAllAircraft() => _trackedAircraft.Values.ToList();
 
+    public int? GameTimeSeconds =>
+        Volatile.Read(ref _gameTimeOfDayTicks) is >= 0 and var ticks ? (int)(ticks / TimeSpan.TicksPerSecond) : null;
+
+    // Each connection must send its own ReferenceTime before its frame times give a game time.
+    private void ResetGameTime()
+    {
+        _hasReferenceTime = false;
+        Volatile.Write(ref _gameTimeOfDayTicks, -1);
+    }
+
     public void AddTrackingForAircraft(string? objectId)
     {
         if (string.IsNullOrEmpty(objectId)) return;
         _trackedAircraft.TryAdd(objectId, new AcmiAircraft { ObjectId = objectId });
     }
-
-    /// <summary>Clears all tracked aircraft</summary>
-    public void ClearAircraft()
-    {
-        _trackedAircraft.Clear();
-        _allEncounteredCallsigns.Clear();
-        _selectedAircraftId = null;
-        _logger.LogInformation("Cleared all tracked aircraft");
-    }
-
-    /// <summary>Gets all encountered callsigns as a dictionary of objectId -> callsign</summary>
-    public IReadOnlyDictionary<string, string> GetAllEncounteredCallsigns() =>
-        _allEncounteredCallsigns;
-
-    /// <summary>Gets a list of all unique callsigns encountered</summary>
-    public IEnumerable<string> GetCallsignsList() =>
-        _allEncounteredCallsigns.Values.Distinct().OrderBy(c => c);
-
-    /// <summary>Selects an aircraft to track by its object ID</summary>
-    public bool SelectAircraftById(string objectId)
-    {
-        if (_trackedAircraft.ContainsKey(objectId))
-        {
-            _selectedAircraftId = objectId;
-            _logger.LogInformation("Selected aircraft: {ObjectId}", objectId);
-            return true;
-        }
-        return false;
-    }
-
-    /// <summary>Selects an aircraft to track by its callsign</summary>
-    public bool SelectAircraftByCallsign(string callsign)
-    {
-        var objectId = _allEncounteredCallsigns
-            .FirstOrDefault(kvp => kvp.Value.Equals(callsign, StringComparison.OrdinalIgnoreCase))
-            .Key;
-
-        if (!string.IsNullOrEmpty(objectId))
-        {
-            _selectedAircraftId = objectId;
-            _logger.LogInformation("Selected aircraft by callsign: {CallSign} (ID: {ObjectId})", callsign, objectId);
-            return true;
-        }
-        return false;
-    }
-
-    /// <summary>Gets the currently selected aircraft</summary>
-    public AcmiAircraft? GetSelectedAircraft() =>
-        _selectedAircraftId != null ? GetAircraft(_selectedAircraftId) : null;
-
-    /// <summary>Clears the aircraft selection</summary>
-    public void ClearSelection()
-    {
-        _selectedAircraftId = null;
-        _logger.LogInformation("Cleared aircraft selection");
-    }
-
-    /// <summary>Gets the object ID of the currently selected aircraft</summary>
-    public string? SelectedAircraftId => _selectedAircraftId;
 
     private async Task ConnectionLoopAsync(CancellationToken cancellationToken)
     {
@@ -343,6 +288,7 @@ public class AcmiClientService : IAcmiClientService
                 _client?.Dispose();
                 _stream = null;
                 _client = null;
+                ResetGameTime();
             }
         }
     }
@@ -454,7 +400,7 @@ public class AcmiClientService : IAcmiClientService
         }
     }
 
-    private bool ProcessLine(string line)
+    internal bool ProcessLine(string line)
     {
         if (string.IsNullOrEmpty(line))
             return false;
@@ -470,6 +416,8 @@ public class AcmiClientService : IAcmiClientService
                 CultureInfo.InvariantCulture, out double time))
             {
                 _relativeTime = time;
+                if (_hasReferenceTime)
+                    Volatile.Write(ref _gameTimeOfDayTicks, _referenceTime.AddSeconds(time).TimeOfDay.Ticks);
                 return true;
             }
             return false;
@@ -570,16 +518,10 @@ public class AcmiClientService : IAcmiClientService
 
         ParseAircraftProperties(aircraftData, span.Slice(firstComma + 1));
 
-        // Track callsign and fire discovery event for new aircraft
+        // Fire discovery event for new aircraft
         if (isNewAircraft && !string.IsNullOrEmpty(aircraftData.CallSign))
         {
-            _allEncounteredCallsigns.TryAdd(objectId, aircraftData.CallSign);
             RaiseAircraftDiscovered(aircraftData);
-        }
-        else if (!string.IsNullOrEmpty(aircraftData.CallSign))
-        {
-            // Update callsign if changed
-            _allEncounteredCallsigns.AddOrUpdate(objectId, aircraftData.CallSign, (_, _) => aircraftData.CallSign);
         }
 
         return true;
@@ -620,6 +562,7 @@ public class AcmiClientService : IAcmiClientService
                 CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var refTime))
             {
                 _referenceTime = refTime.ToUniversalTime();
+                _hasReferenceTime = true;
             }
         }
     }

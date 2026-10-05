@@ -7,17 +7,12 @@ namespace FalconRadioService.Services;
 
 public interface IFalconRadioSharedMemoryService : IDisposable, ILifecycleService
 {
-    // Service state
-    ServiceState State { get; }
-    double PollingFrequencyHz { get; set; }
-
     // True while another client (IVC or another OpenFreq instance) owns the radio mutex, so we don't.
     bool HasConflict { get; }
 
     // Current data (thread-safe)
     string? LogbookName { get; }
     RadioChannel? GetRadioChannel(RadioType radioType);
-    RadioDevice? GetRadioDevice(RadioDeviceType deviceType);
     ConnectionParameters? ConnectionParameters { get; }
 
     // Client status management
@@ -45,6 +40,11 @@ public interface IFalconRadioSharedMemoryService : IDisposable, ILifecycleServic
     event EventHandler? RadioClientConflict;
     event EventHandler? RadioClientConflictResolved;
 
-    // Constant
+    // BMS parks a radio on a dummy frequency that nobody can transmit to. The names come from
+    // FALCLIB/RadioSpectrum.cpp: UHF_GUARD_OFF and VHF_GUARD_OFF.
     public const int BmsRadioOffFrequency = 9999;
+    public const int BmsVhfRadioOffFrequency = 9998;
+
+    public static bool IsBmsParkingFrequency(int frequencyKhz) =>
+        frequencyKhz is BmsRadioOffFrequency or BmsVhfRadioOffFrequency;
 }

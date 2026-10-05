@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging.Abstractions;
-using OpenFreq.Common;
 using OpenFreq.Common.Rtp;
 using static OpenFreq.Common.RtpAudioReceiver;
 
@@ -14,12 +13,10 @@ public class RtpJitterBufferPoolTests
     private static RtpJitterBufferPool CreatePool(out Channel<AudioReceivedEventArgs> player)
     {
         player = Channel.CreateUnbounded<AudioReceivedEventArgs>();
-        // opusEnabled: false avoids creating native Opus decoders in the per-source contexts.
         return new RtpJitterBufferPool(
             NullLoggerFactory.Instance,
             CancellationToken.None,
             player.Writer,
-            opusEnabled: false,
             initialBufferMs: 40);
     }
 

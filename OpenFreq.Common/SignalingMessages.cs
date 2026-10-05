@@ -49,6 +49,9 @@ public class AudioTransmissionMessage
     [JsonPropertyName("transmitting")] public bool Transmitting { get; set; }
 
     [JsonPropertyName("3d")] public bool Is3d { get; set; }
+
+    /// <summary>The sender's in-game time of day in seconds, or null when it has no game clock.</summary>
+    [JsonPropertyName("gameTime")] public int? GameTimeSeconds { get; set; }
 }
 
 /// <summary>
@@ -70,8 +73,6 @@ public class SuccessMessage
     [JsonPropertyName("peerId")] public string? PeerId { get; set; }
 
     [JsonPropertyName("audioPort")] public int? AudioPort { get; set; }
-
-    [JsonPropertyName("opusCompression")] public bool OpusCompressionEnabled { get; set; }
 
     [JsonPropertyName("frequencies")] public SortedDictionary<int, List<PeerData>> FrequenciesPeers { get; set; } = [];
 

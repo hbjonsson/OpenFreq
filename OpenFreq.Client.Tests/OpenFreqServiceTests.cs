@@ -1,4 +1,6 @@
 using OpenFreq.Common;
+using OpenFreqClient.Models;
+using OpenFreqClient.Services;
 using OpenFreqClient.Services.Interfaces;
 
 namespace OpenFreq.Client.Tests;
@@ -117,6 +119,110 @@ public class OpenFreqServiceTests
     }
 
     [Fact]
+    public async Task LeaveFrequency_SlotNeverJoined_DoesNothing()
+    {
+        var h = new ServiceHarness();
+        await h.InitializeAuthenticatedAsync();
+        var statuses = new List<FrequencyConnectionStatusEventArgs>();
+        h.Service.FrequencyConnectionStatusChanged += (_, e) => statuses.Add(e);
+
+        await h.Service.LeaveFrequencyAsync(Freq, Guid.NewGuid());
+
+        await h.Client.DidNotReceiveWithAnyArgs().LeaveFrequencyAsync(default);
+        h.Playback.DidNotReceiveWithAnyArgs().UntuneFrequency(default, default);
+        Assert.Empty(statuses);
+    }
+
+    [Fact]
+    public async Task JoinFrequency_AlreadyJoinedFromAnotherLocation_IsRefusedWithReason()
+    {
+        var h = new ServiceHarness();
+        await h.InitializeAuthenticatedAsync();
+        await h.Service.JoinFrequencyAsync(Freq, Guid.NewGuid(), ServiceHarness.NewRadioStation());
+
+        var statuses = new List<FrequencyConnectionStatusEventArgs>();
+        h.Service.FrequencyConnectionStatusChanged += (_, e) => statuses.Add(e);
+
+        // Each location hands its cards its own RadioStationData, so another instance is another location.
+        var slot = Guid.NewGuid();
+        await h.Service.JoinFrequencyAsync(Freq, slot, ServiceHarness.NewRadioStation());
+
+        Assert.False(h.Service.IsFrequencyJoined(Freq, slot));
+        h.Playback.DidNotReceive().TuneFrequency(Freq, slot);
+        var status = Assert.Single(statuses);
+        Assert.Equal(slot, status.SlotId);
+        Assert.Equal(Channel.ChannelConnectionStatus.Disconnected, status.ConnectionStatus);
+        Assert.NotNull(status.Reason);
+    }
+
+    [Fact]
+    public async Task JoinFrequency_SecondCardInSameLocation_Connects()
+    {
+        var h = new ServiceHarness();
+        await h.InitializeAuthenticatedAsync();
+        var station = ServiceHarness.NewRadioStation();
+        await h.Service.JoinFrequencyAsync(Freq, Guid.NewGuid(), station);
+
+        var statuses = new List<FrequencyConnectionStatusEventArgs>();
+        h.Service.FrequencyConnectionStatusChanged += (_, e) => statuses.Add(e);
+
+        var slot = Guid.NewGuid();
+        await h.Service.JoinFrequencyAsync(Freq, slot, station);
+
+        Assert.True(h.Service.IsFrequencyJoined(Freq, slot));
+        var status = Assert.Single(statuses);
+        Assert.Equal(Channel.ChannelConnectionStatus.Connected, status.ConnectionStatus);
+        Assert.Null(status.Reason);
+    }
+
+    [Fact]
+    public async Task ConcurrentJoinsAndLeaves_ServerJoinsAndLeavesAlternate()
+    {
+        var h = new ServiceHarness();
+        await h.InitializeAuthenticatedAsync();
+
+        // Every server join and leave, in the order the service hands them to the client.
+        var serverCalls = new List<string>();
+        h.Client.When(c => c.JoinFrequencyAsync(Freq)).Do(_ => { lock (serverCalls) serverCalls.Add("join"); });
+        h.Client.When(c => c.LeaveFrequencyAsync(Freq)).Do(_ => { lock (serverCalls) serverCalls.Add("leave"); });
+
+        var station = ServiceHarness.NewRadioStation();
+        Guid[] slots = [Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()];
+        await Parallel.ForAsync(0, 2_000, async (i, _) =>
+        {
+            var slot = slots[i % slots.Length];
+            if (i % 2 == 0) await h.Service.JoinFrequencyAsync(Freq, slot, station);
+            else await h.Service.LeaveFrequencyAsync(Freq, slot);
+        });
+
+        // The server is joined when a frequency's first slot tunes and left when its last slot goes,
+        // so the calls must alternate, and end on a join exactly when a slot is still tuned.
+        for (var i = 0; i < serverCalls.Count; i++)
+            Assert.Equal(i % 2 == 0 ? "join" : "leave", serverCalls[i]);
+        Assert.Equal(slots.Any(s => h.Service.IsFrequencyJoined(Freq, s)), serverCalls.Count % 2 == 1);
+    }
+
+    [Fact]
+    public async Task ConcurrentJoinsFromTwoLocations_OnlyOneLocationGetsTheFrequency()
+    {
+        var h = new ServiceHarness();
+        await h.InitializeAuthenticatedAsync();
+        var locations = new[] { ServiceHarness.NewRadioStation(), ServiceHarness.NewRadioStation() };
+        var cards = Enumerable.Range(0, 200)
+            .Select(i => (Slot: Guid.NewGuid(), Station: locations[i % locations.Length]))
+            .ToList();
+
+        await Parallel.ForEachAsync(cards, async (card, _) =>
+            await h.Service.JoinFrequencyAsync(Freq, card.Slot, card.Station));
+
+        Assert.Single(cards
+            .Where(card => h.Service.IsFrequencyJoined(Freq, card.Slot))
+            .Select(card => card.Station)
+            .Distinct(ReferenceEqualityComparer.Instance));
+        await h.Client.Received(1).JoinFrequencyAsync(Freq);
+    }
+
+    [Fact]
     public async Task ClientFrequencyJoined_ReRaisesEvent()
     {
         var h = new ServiceHarness();
@@ -130,6 +236,28 @@ public class OpenFreqServiceTests
 
         Assert.NotNull(seen);
         Assert.Equal(Freq, seen!.FrequencyKhz);
+    }
+
+    [Fact]
+    public async Task ClientFrequencyJoined_MarksOnlyTunedSlotsConnected()
+    {
+        var h = new ServiceHarness();
+        await h.InitializeAuthenticatedAsync();
+        var tuned = Guid.NewGuid();
+        await h.Service.JoinFrequencyAsync(Freq, tuned, ServiceHarness.NewRadioStation());
+
+        var connectedSlots = new List<Guid>();
+        h.Service.FrequencyConnectionStatusChanged += (_, e) =>
+        {
+            if (e.ConnectionStatus == Channel.ChannelConnectionStatus.Connected) connectedSlots.Add(e.SlotId);
+        };
+
+        h.Client.FrequencyJoined +=
+            Raise.EventWith(new FrequencyJoinedEventArgs(Freq, new List<ChannelStateMessage.Peer>()));
+
+        // Cards can sit on this frequency without having joined it; only the slot that tuned may
+        // go Connected, or PTT would transmit on a slot the audio path can't resolve.
+        Assert.Equal(tuned, Assert.Single(connectedSlots));
     }
 
     [Fact]

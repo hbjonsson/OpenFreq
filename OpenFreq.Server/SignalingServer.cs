@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -69,11 +70,24 @@ public class SignalingServer
             new EventId(5, nameof(LeaveCurrentChannel)),
             "{DisplayName} ({ClientId}) left frequency {Frequency:F3} MHz");
 
+    // Debug: clients repeat "transmitting" every 333 ms. LogPttStart and LogPttEnd record the changes.
     private static readonly Action<ILogger, string, string, bool, double, int, Exception?> LogTransmissionState =
         LoggerMessage.Define<string, string, bool, double, int>(
-            LogLevel.Information,
+            LogLevel.Debug,
             new EventId(6, nameof(HandleTransmission)),
             "{DisplayName} ({ClientId}) transmission: {IsTransmitting} on {Frequency:F3} MHz, broadcasting to {PeerCount} peer(s)");
+
+    private static readonly Action<ILogger, string, string, double, string, string, Exception?> LogPttStart =
+        LoggerMessage.Define<string, string, double, string, string>(
+            LogLevel.Information,
+            new EventId(9, nameof(HandleTransmission)),
+            "PTT start: {DisplayName} ({ClientId}) on {Frequency:F3} MHz, {Mode}{GameTimeSuffix}");
+
+    private static readonly Action<ILogger, string, string, double, string, string, Exception?> LogPttEnd =
+        LoggerMessage.Define<string, string, double, string, string>(
+            LogLevel.Information,
+            new EventId(10, nameof(HandleTransmission)),
+            "PTT end: {DisplayName} ({ClientId}) on {Frequency:F3} MHz, {Reason}{GameTimeSuffix}");
 
     private static readonly Action<ILogger, string, string, Exception?> LogClientCleanedUp =
         LoggerMessage.Define<string, string>(
@@ -98,8 +112,7 @@ public class SignalingServer
     /// </summary>
     public int? BoundWebSocketPort { get; private set; }
 
-    private static string GetDisplayName(ClientSession session) =>
-        !string.IsNullOrWhiteSpace(session.DisplayName) ? session.DisplayName : "Unnamed";
+    private static string GetDisplayName(ClientSession session) => DisplayNames.ForLog(session.DisplayName);
 
     public SignalingServer(ServerConfig config, ILoggerFactory loggerFactory)
         : this(config, loggerFactory, null, null, null)
@@ -436,7 +449,7 @@ public class SignalingServer
             var audioPort = _audioServer.CreateAudioSession(session.Id);
             LogClientAuthenticated(_logger, GetDisplayName(session), session.Id, audioPort, null);
 
-            await SendSuccess(session, "Authenticated", session.Id, audioPort, _config.EnableOpusCompression);
+            await SendSuccess(session, "Authenticated", session.Id, audioPort);
         }
         else
         {
@@ -470,46 +483,35 @@ public class SignalingServer
             return;
         }
 
-        var channelCount = _channelManager.GetChannelCount(joinMsg.FrequencyKhz);
+        var joinResult = _channelManager.JoinChannel(
+            joinMsg.FrequencyKhz,
+            session.Id,
+            session.DisplayName ?? "Unnamed",
+            session.Is3d,
+            _config.MaxClientsPerChannel);
 
-        if (channelCount >= _config.MaxClientsPerChannel)
+        switch (joinResult)
         {
-            await SendError(session, "Channel is full");
-            return;
+            case AlreadyInChannel:
+                // A reconnect race (the RTC client auto-rejoins while the app layer also
+                // rejoins a radio channel) can send a duplicate join on the same session.
+                // Just resend the current channel state.
+                await SendChannelState(session, joinMsg.FrequencyKhz,
+                    CollectChannelPeers(joinMsg.FrequencyKhz, session.Id));
+                return;
+
+            case ChannelFull:
+                await SendError(session, "Channel is full");
+                return;
+
+            case ChannelJoined:
+                break;
+
+            default: throw new UnreachableException();
         }
 
-        if (session.CurrentFrequencies.ContainsKey(joinMsg.FrequencyKhz))
-        {
-            // Idempotent rejoin. A reconnect race (the RTC client auto-rejoins while the
-            // app layer also rejoins a radio channel) can send a duplicate join on the same session.
-            // Just resend the current channel state.
-            List<ChannelStateMessage.Peer> currentPeers = [];
-            foreach (var clientId in _channelManager.GetClientsInChannel(joinMsg.FrequencyKhz))
-            {
-                if (clientId == session.Id) continue;
-                _clients.TryGetValue(clientId, out var clientSession);
-                if (clientSession == null) continue;
-                currentPeers.Add(new ChannelStateMessage.Peer(clientSession.Id, clientSession.DisplayName ?? "Unnamed"));
-            }
-
-            await SendChannelState(session, joinMsg.FrequencyKhz, currentPeers);
-            return;
-        }
-
-        _channelManager.JoinChannel(joinMsg.FrequencyKhz, session.Id, session.DisplayName ?? "Unnamed", session.Is3d);
-
-        session.CurrentFrequencies.TryAdd(joinMsg.FrequencyKhz, ClientSession.FrequencyClientStatus.Receiving);
-
-        List<ChannelStateMessage.Peer> peers = [];
-        foreach (var clientId in _channelManager.GetClientsInChannel(joinMsg.FrequencyKhz))
-        {
-            if (clientId == session.Id) continue;
-            _clients.TryGetValue(clientId, out var clientSession);
-            if (clientSession == null) continue;
-            peers.Add(new ChannelStateMessage.Peer(clientSession.Id, clientSession.DisplayName ?? "Unnamed"));
-        }
-
-        await SendChannelState(session, joinMsg.FrequencyKhz, peers);
+        await SendChannelState(session, joinMsg.FrequencyKhz,
+            CollectChannelPeers(joinMsg.FrequencyKhz, session.Id));
 
         await BroadcastToChannel(
             joinMsg.FrequencyKhz,
@@ -522,6 +524,23 @@ public class SignalingServer
             RequestPeerUpdateBroadcast();
     }
 
+    /// <summary>
+    /// The peers a client should be told about on a frequency: everyone routable there
+    /// except the client itself, skipping any whose session has since gone away.
+    /// </summary>
+    private List<ChannelStateMessage.Peer> CollectChannelPeers(int frequencyKhz, string excludeClientId)
+    {
+        List<ChannelStateMessage.Peer> peers = [];
+        foreach (var clientId in _channelManager.GetClientsInChannel(frequencyKhz))
+        {
+            if (clientId == excludeClientId) continue;
+            if (!_clients.TryGetValue(clientId, out var clientSession)) continue;
+            peers.Add(new ChannelStateMessage.Peer(clientSession.Id, clientSession.DisplayName ?? "Unnamed"));
+        }
+
+        return peers;
+    }
+
     private async Task HandleLeaveChannel(ClientSession session, SignalingMessage message)
     {
         await LeaveCurrentChannel(session, message);
@@ -529,20 +548,20 @@ public class SignalingServer
 
     private async Task LeaveCurrentChannel(ClientSession session, SignalingMessage message)
     {
-        if (session.CurrentFrequencies.IsEmpty) return;
+        if (!_channelManager.IsInAnyChannel(session.Id)) return;
 
         var transmissionMsg = SignalingMessageFactory.DeserializePayload<AudioTransmissionMessage>(message.Payload);
         if (transmissionMsg == null) return;
 
         var frequencyKhz = transmissionMsg.FrequencyKhz;
-        _channelManager.LeaveChannel(frequencyKhz, session.Id);
+        if (_channelManager.LeaveChannel(frequencyKhz, session.Id) is { Status: PeerData.PeerStatus.Transmitting })
+            LogTransmissionEnded(session, frequencyKhz, "left the frequency");
 
         await BroadcastToChannel(
             frequencyKhz,
             session.Id,
             SignalingMessageFactory.CreatePeerLeft(session.Id, frequencyKhz));
 
-        session.CurrentFrequencies.TryRemove(frequencyKhz, out _);
         LogClientLeftFrequency(_logger, GetDisplayName(session), session.Id, frequencyKhz / 1000d, null);
 
         if (_config.BroadcastPeerUpdates)
@@ -551,18 +570,19 @@ public class SignalingServer
 
     private async Task LeaveAllChannels(ClientSession session)
     {
-        var frequencies = session.CurrentFrequencies.Keys.ToArray();
+        var frequencies = _channelManager.GetClientChannels(session.Id);
 
         foreach (var frequency in frequencies)
         {
-            _channelManager.LeaveChannel(frequency, session.Id);
+            // Only CleanupClient calls this, so a transmission still in progress ends with the connection.
+            if (_channelManager.LeaveChannel(frequency, session.Id) is { Status: PeerData.PeerStatus.Transmitting })
+                LogTransmissionEnded(session, frequency, "disconnected");
 
             await BroadcastToChannel(
                 frequency,
                 session.Id,
                 SignalingMessageFactory.CreatePeerLeft(session.Id, frequency));
 
-            session.CurrentFrequencies.TryRemove(frequency, out _);
             LogClientLeftFrequency(_logger, GetDisplayName(session), session.Id, frequency / 1000d, null);
         }
 
@@ -573,41 +593,55 @@ public class SignalingServer
     private async Task HandleTransmission(ClientSession session, SignalingMessage message)
     {
         if (!session.IsAuthenticated) return;
-        if (session.CurrentFrequencies.IsEmpty) return;
+        if (!_channelManager.IsInAnyChannel(session.Id)) return;
 
         var transmissionMsg = SignalingMessageFactory.DeserializePayload<AudioTransmissionMessage>(message.Payload);
         if (transmissionMsg == null) return;
 
-        if (session.CurrentFrequencies.TryGetValue(transmissionMsg.FrequencyKhz,
-                out var frequencyStatus))
+        // Record the transmit state on the peer entry itself, so the channel snapshot sent
+        // out as allPeersStatus reports who is talking. It used to say "receiving" for
+        // everyone forever, which fought the per-event updates clients apply on top: any
+        // peer-list broadcast landing mid-transmission cleared the sender's TX indicator.
+        if (_channelManager.SetTransmissionState(
+                transmissionMsg.FrequencyKhz, session.Id, transmissionMsg.Transmitting, transmissionMsg.Is3d)
+            is not { } update) return;
+
+        session.LastGameTimeSeconds = transmissionMsg.GameTimeSeconds;
+        var displayName = GetDisplayName(session);
+
+        LogTransmissionState(_logger, displayName, session.Id, transmissionMsg.Transmitting,
+            transmissionMsg.FrequencyKhz / 1000d, update.OtherClients.Length, null);
+
+        if (update.Changed)
         {
-            session.CurrentFrequencies.TryUpdate(transmissionMsg.FrequencyKhz,
-                transmissionMsg.Transmitting
-                    ? ClientSession.FrequencyClientStatus.Transmitting
-                    : ClientSession.FrequencyClientStatus.Receiving, frequencyStatus);
+            if (transmissionMsg.Transmitting)
+            {
+                LogPttStart(_logger, displayName, session.Id, transmissionMsg.FrequencyKhz / 1000d,
+                    transmissionMsg.Is3d ? "3D" : "2D", GameClock.LogSuffix(transmissionMsg.GameTimeSeconds), null);
+            }
+            else
+            {
+                LogTransmissionEnded(session, transmissionMsg.FrequencyKhz, "released");
+            }
         }
-        else return;
-
-        _channelManager.UpdateIs3d(transmissionMsg.FrequencyKhz, session.Id, transmissionMsg.Is3d);
-
-        if (!session.CurrentFrequencies.ContainsKey(transmissionMsg.FrequencyKhz)) return;
-
-        var peersInChannel = _channelManager.GetClientsInChannel(transmissionMsg.FrequencyKhz)
-            .Where(id => id != session.Id)
-            .ToArray();
-
-        LogTransmissionState(_logger, GetDisplayName(session), session.Id, transmissionMsg.Transmitting,
-            transmissionMsg.FrequencyKhz / 1000d, peersInChannel.Length, null);
 
         await BroadcastToChannel(
             transmissionMsg.FrequencyKhz,
             session.Id,
             SignalingMessageFactory.CreateTransmissionEvent(
                 session.Id,
+                displayName,
                 transmissionMsg.FrequencyKhz,
                 transmissionMsg.Transmitting,
                 transmissionMsg.Is3d));
     }
+
+    /// <summary>
+    /// Logs the end of a client's transmission, at the game time from its latest transmission message.
+    /// </summary>
+    private void LogTransmissionEnded(ClientSession session, int frequencyKhz, string reason) =>
+        LogPttEnd(_logger, GetDisplayName(session), session.Id, frequencyKhz / 1000d, reason,
+            GameClock.LogSuffix(session.LastGameTimeSeconds), null);
 
     private Task HandleModeUpdate(ClientSession session, SignalingMessage message)
     {
@@ -617,8 +651,7 @@ public class SignalingServer
         if (modeMsg == null) return Task.CompletedTask;
 
         session.Is3d = modeMsg.Is3d;
-        foreach (var frequencyKhz in session.CurrentFrequencies.Keys)
-            _channelManager.UpdateIs3d(frequencyKhz, session.Id, modeMsg.Is3d);
+        _channelManager.UpdateIs3d(session.Id, modeMsg.Is3d);
 
         RequestPeerUpdateBroadcast();
         return Task.CompletedTask;
@@ -752,12 +785,10 @@ public class SignalingServer
         await SendToClient(session, SignalingMessageFactory.CreateError(error));
     }
 
-    private async Task SendSuccess(ClientSession session, string message, string? peerId = null, int? audioPort = null,
-        bool opusEnabled = true)
+    private async Task SendSuccess(ClientSession session, string message, string? peerId = null, int? audioPort = null)
     {
         await SendToClient(session,
-            SignalingMessageFactory.CreateSuccess(message, _channelManager.GetAllChannelStates(), peerId, audioPort,
-                opusEnabled));
+            SignalingMessageFactory.CreateSuccess(message, _channelManager.GetAllChannelStates(), peerId, audioPort));
     }
 
     private async Task SendChannelState(ClientSession session, int frequencyKhz, List<ChannelStateMessage.Peer> peers)
@@ -771,7 +802,15 @@ public class SignalingServer
         {
             await LeaveAllChannels(session);
 
-            _channelManager.LeaveAllChannels(clientId);
+            // Not redundant with the above: that loop awaits a broadcast per channel, and the
+            // client's own message pump runs concurrently (this can be called fire-and-forget
+            // from the idle watchdog), so a join can land in one of those gaps. Sweep again.
+            foreach (var (frequency, peer) in _channelManager.LeaveAllChannels(clientId))
+            {
+                if (peer.Status == PeerData.PeerStatus.Transmitting)
+                    LogTransmissionEnded(session, frequency, "disconnected");
+            }
+
             _audioServer.RemoveSession(clientId);
 
             if (session.WebSocket.State == WebSocketState.Open)

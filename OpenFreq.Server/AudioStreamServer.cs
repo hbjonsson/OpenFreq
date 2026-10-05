@@ -42,9 +42,6 @@ public class AudioStreamServer : IAudioStreamServer
     // Single receive task for all clients
     private Task? _receiveTask;
 
-    // Backpressure configuration
-    private const int MaxPendingSendsPerClient = 3;
-
     // Pre-built minimal RTP pong packet sent back on every client keepalive to maintain
     // the server→client NAT mapping even during long silent periods.
     private static readonly byte[] _keepalivePong = new RtpPacket
@@ -71,12 +68,6 @@ public class AudioStreamServer : IAudioStreamServer
             LogLevel.Debug,
             new EventId(2, nameof(ForwardAudioToReceivers)),
             "{DisplayName} ({ClientId}) transmitting on {FrequencyCount} frequency(ies)");
-
-    private static readonly Action<ILogger, string, string, int, int, Exception?> LogSessionRemoved =
-        LoggerMessage.Define<string, string, int, int>(
-            LogLevel.Information,
-            new EventId(4, nameof(RemoveSession)),
-            "Removed session for {DisplayName} ({ClientId}) - Sent: {Sent}, Dropped: {Dropped}");
 
     private static readonly Action<ILogger, string, string, string, Exception?> LogEndpointMapped =
         LoggerMessage.Define<string, string, string>(
@@ -232,37 +223,34 @@ public class AudioStreamServer : IAudioStreamServer
                     continue;
                 }
 
-                if (!_clients.TryGetValue(clientId, out var clientSession))
-                    continue;
+                var targets = _channelManager.ResolveRelay(clientId,
+                    [.. metadata.Frequencies.Select(f => f.Khz)]);
 
-                var validFrequencies = metadata.Frequencies
-                    .Where(freq => clientSession.CurrentFrequencies.ContainsKey(freq.Khz))
-                    .ToList();
-
-                if (validFrequencies.Count < metadata.Frequencies.Count)
+                if (targets.Rejected.Length > 0 && _logger.IsEnabled(LogLevel.Warning))
                 {
-                    var validKhz = validFrequencies.Select(f => f.Khz).ToHashSet();
-                    var invalidMhz = metadata.Frequencies
-                        .Where(f => !validKhz.Contains(f.Khz))
-                        .Select(f => (f.Khz / 1000d).ToString("F3", CultureInfo.InvariantCulture) + " MHz")
-                        .ToList();
+                    var invalidMhz = targets.Rejected
+                        .Select(khz => (khz / 1000d).ToString("F3", CultureInfo.InvariantCulture) + " MHz");
 
-                    if (_logger.IsEnabled(LogLevel.Warning))
-                        _logger.LogWarning(
-                            "{DisplayName} ({ClientId}) attempted to transmit on unjoined frequencies: {Frequencies}",
-                            GetDisplayName(clientId), clientId, string.Join(", ", invalidMhz));
+                    _logger.LogWarning(
+                        "{DisplayName} ({ClientId}) attempted to transmit on unjoined frequencies: {Frequencies}",
+                        GetDisplayName(clientId), clientId, string.Join(", ", invalidMhz));
                 }
 
-                if (validFrequencies.Count == 0)
+                if (targets.Valid.Length == 0)
                     continue;
 
                 if (_logger.IsEnabled(LogLevel.Debug))
                     LogTransmittingOnFrequencies(_logger, GetDisplayName(clientId), clientId,
-                        validFrequencies.Count, null);
+                        targets.Valid.Length, null);
 
-                // Forward audio to all receivers — deduplicated so a client on multiple matching
-                // frequencies gets exactly one packet (metadata contains all frequencies).
-                ForwardAudioToReceivers(validFrequencies.Select(f => f.Khz), clientId, rtpPacket, metadata, audioData);
+                // Receivers log the talker by this name. Take it from the session rather than the packet,
+                // since the packet name is left empty in some situations
+                // (e.g., when the session name is pulled from shared memory).
+                metadata.DisplayName = GetDisplayName(clientId);
+
+                // Already deduplicated, so a client on several of the matched frequencies
+                // gets exactly one packet (its metadata carries all of them).
+                ForwardAudioToReceivers(targets.Recipients, rtpPacket, metadata, audioData);
             }
 
             catch (SocketException ex)
@@ -374,28 +362,16 @@ public class AudioStreamServer : IAudioStreamServer
     }
 
     /// <summary>
-    /// Forward audio to all unique receivers across the given frequency channels.
-    /// A receiver joined to multiple matching frequencies receives exactly one packet.
+    /// Forward audio to the given receivers, already deduplicated across the matched
+    /// channels by <see cref="FrequencyChannelManager.ResolveRelay"/>.
     /// </summary>
     private void ForwardAudioToReceivers(
-        IEnumerable<int> frequencyKhzList,
-        string sourceClientId,
+        IEnumerable<string> receiverClientIds,
         RtpPacket originalRtpPacket,
         AudioPacketMetadata metadata,
         byte[] audioData)
     {
-        // Collect unique receivers across all matched channels.
-        var seen = new HashSet<string>();
-        foreach (var frequencyKhz in frequencyKhzList)
-        {
-            foreach (var clientId in _channelManager.GetClientsInChannel(frequencyKhz))
-            {
-                if (clientId != sourceClientId)
-                    seen.Add(clientId);
-            }
-        }
-
-        foreach (var clientId in seen)
+        foreach (var clientId in receiverClientIds)
         {
             if (!_sessions.TryGetValue(clientId, out var targetSession))
                 continue;
@@ -501,18 +477,6 @@ public class ReceiverRtpState
     public long PacketsSent { get; set; }
 }
 
-/// <summary>
-/// RTP statistics for a receiver
-/// </summary>
-[SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")]
-public class ReceiverRtpStats
-{
-    public string ClientId { get; set; } = "";
-    public uint Ssrc { get; set; }
-    public long PacketsSent { get; set; }
-    public ushort CurrentSequence { get; set; }
-}
-
 [SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")]
 public class AudioStreamSession
 {
@@ -520,14 +484,4 @@ public class AudioStreamSession
     public int Port { get; set; }
     public IPEndPoint? RemoteEndPoint { get; set; }
     public DateTime LastReceived { get; set; } = DateTime.UtcNow;
-}
-
-[SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")]
-public class ClientStreamStats
-{
-    public string ClientId { get; set; } = string.Empty;
-    public int SentPackets { get; set; }
-    public int DroppedPackets { get; set; }
-    public int PendingSends { get; set; }
-    public DateTime LastSendTime { get; set; }
 }

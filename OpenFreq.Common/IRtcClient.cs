@@ -1,4 +1,3 @@
-using System.Numerics;
 using Microsoft.Extensions.Logging;
 using OpenFreqAudio;
 
@@ -27,6 +26,12 @@ public interface IRtcClient : IDisposable
     string? MyPeerId { get; }
     bool IsConnected { get; }
     bool IsAuthenticated { get; }
+
+    /// <summary>
+    /// Supplies the in-game time of day in seconds, or null when there is no game clock. Every transmission
+    /// message, including each heartbeat, carries its current value.
+    /// </summary>
+    Func<int?>? GameTimeSeconds { get; set; }
 
     Task ConnectAsync(TimeSpan? connectTimeout = null);
     Task DisconnectAsync();

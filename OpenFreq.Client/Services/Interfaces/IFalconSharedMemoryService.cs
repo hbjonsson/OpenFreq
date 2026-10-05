@@ -2,7 +2,6 @@ using System;
 using FalconBmsDataService.Models;
 using FalconRadioService.Models;
 using OpenFreq.Client.Services.Interfaces;
-using OpenFreq.Common;
 
 namespace FalconBmsDataService.Services;
 
@@ -32,11 +31,6 @@ public interface IFalconSharedMemoryService : IDisposable, ILifecycleService
     string? TheaterTerrainDir { get; }
 
     /// <summary>
-    /// Current aircraft name, e.g. "F-16C Block 52+" (read once on connect, null if never connected)
-    /// </summary>
-    string? AcName { get; }
-
-    /// <summary>
     /// Current aircraft NCTR string (read once on connect, null if never connected)
     /// </summary>
     string? AcNCTR { get; }
@@ -47,9 +41,9 @@ public interface IFalconSharedMemoryService : IDisposable, ILifecycleService
     bool? IsFlying { get; }
 
     /// <summary>
-    /// Polling frequency in Hz (default: 2.0 = 2 times per second)
+    /// In-game time of day in seconds (null if disconnected, not in 3D, or if BMS does not report it)
     /// </summary>
-    double PollingFrequencyHz { get; set; }
+    int? GameTimeSeconds { get; }
 
     /// <summary>
     /// Event fired when service state changes

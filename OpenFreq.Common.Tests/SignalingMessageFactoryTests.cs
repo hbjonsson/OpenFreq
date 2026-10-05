@@ -110,6 +110,28 @@ public class SignalingMessageFactoryTests
     }
 
     [Fact]
+    public void CreateTransmission_GameTime_PayloadRoundTrips()
+    {
+        var msg = SignalingMessageFactory.CreateTransmission(251000, transmitting: true, is3d: false,
+            gameTimeSeconds: 45296);
+        var payload = SignalingMessageFactory.DeserializePayload<AudioTransmissionMessage>(msg.Payload);
+
+        Assert.NotNull(payload);
+        Assert.Equal(45296, payload.GameTimeSeconds);
+    }
+
+    [Fact]
+    public void CreateTransmission_NoGameTime_IsNotWritten()
+    {
+        var msg = SignalingMessageFactory.CreateTransmission(251000, transmitting: true, is3d: false);
+
+        Assert.False(msg.Payload!.Value.TryGetProperty("gameTime", out _));
+        var payload = SignalingMessageFactory.DeserializePayload<AudioTransmissionMessage>(msg.Payload);
+        Assert.NotNull(payload);
+        Assert.Null(payload.GameTimeSeconds);
+    }
+
+    [Fact]
     public void CreateError_SetsCorrectTypeAndMessage()
     {
         var msg = SignalingMessageFactory.CreateError("Wrong password");
@@ -169,11 +191,13 @@ public class SignalingMessageFactoryTests
     [Fact]
     public void CreateTransmissionEvent_AllFieldsPreserved()
     {
-        var msg = SignalingMessageFactory.CreateTransmissionEvent("peer-7", 251000, transmitting: true, is3d: true);
+        var msg = SignalingMessageFactory.CreateTransmissionEvent("peer-7", "Iceman", 251000, transmitting: true,
+            is3d: true);
 
         var payload = SignalingMessageFactory.DeserializePayload<TransmissionEventMessage>(msg.Payload);
         Assert.NotNull(payload);
         Assert.Equal("peer-7", payload.PeerId);
+        Assert.Equal("Iceman", payload.PeerDisplayName);
         Assert.Equal(251000, payload.FrequencyKhz);
         Assert.True(payload.Transmitting);
         Assert.True(payload.Is3d);
@@ -195,7 +219,7 @@ public class SignalingMessageFactoryTests
     {
         var peers = new SortedDictionary<int, List<PeerData>>();
         var msg = SignalingMessageFactory.CreateSuccess(
-            "Authenticated", peers, peerId: "me-123", audioPort: 9988, opusEnabled: true);
+            "Authenticated", peers, peerId: "me-123", audioPort: 9988);
 
         Assert.Equal(SignalingMessageTypes.Success, msg.Type);
         var payload = SignalingMessageFactory.DeserializePayload<SuccessMessage>(msg.Payload);
@@ -203,7 +227,6 @@ public class SignalingMessageFactoryTests
         Assert.Equal("Authenticated", payload.Message);
         Assert.Equal("me-123", payload.PeerId);
         Assert.Equal(9988, payload.AudioPort);
-        Assert.True(payload.OpusCompressionEnabled);
     }
 
     [Fact]

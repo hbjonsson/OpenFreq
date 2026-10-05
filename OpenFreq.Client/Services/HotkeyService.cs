@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -208,16 +209,16 @@ public class HotkeyService : IHotkeyService
     {
         _logger.LogDebug("Joystick polling thread started");
 
-        var lastRescan = DateTime.UtcNow;
+        var lastRescan = Stopwatch.GetTimestamp();
 
         while (_cts is { Token.IsCancellationRequested: false })
         {
             try
             {
                 // Re-enumerate every 5s to pick up replugged devices
-                if ((DateTime.UtcNow - lastRescan).TotalSeconds >= 5)
+                if (Stopwatch.GetElapsedTime(lastRescan).TotalSeconds >= 5)
                 {
-                    lastRescan = DateTime.UtcNow;
+                    lastRescan = Stopwatch.GetTimestamp();
                     TryAcquireNewDevices();
                 }
 
@@ -417,56 +418,6 @@ public class HotkeyService : IHotkeyService
         _directInput = null;
 
         _logger.LogDebug("DirectInput stopped and cleaned up");
-    }
-
-    public List<JoystickDeviceInfo> GetAvailableJoysticks()
-    {
-        var result = new List<JoystickDeviceInfo>();
-
-        if (_directInput == null)
-        {
-            return result;
-        }
-
-        try
-        {
-            var devices = _directInput.GetDevices(DeviceClass.GameControl, DeviceEnumerationFlags.AttachedOnly);
-
-            foreach (var deviceInstance in devices)
-            {
-                try
-                {
-                    // Try to get button count from capabilities
-                    var device = _directInput.CreateDevice(deviceInstance.InstanceGuid);
-                    var caps = device.Capabilities;
-
-                    result.Add(new JoystickDeviceInfo
-                    {
-                        InstanceGuid = deviceInstance.InstanceGuid,
-                        DeviceName = deviceInstance.InstanceName,
-                        ProductName = deviceInstance.ProductName,
-                        ButtonCount = caps.ButtonCount
-                    });
-
-                    device.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogDebug(ex, "Error getting joystick info for {DeviceName}", deviceInstance.ProductName);
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error enumerating joystick devices");
-        }
-
-        return result;
-    }
-
-    public bool IsJoystickConnected(Guid deviceInstanceGuid)
-    {
-        return _joystickDevices.Any(d => d.DeviceInfo.InstanceGuid == deviceInstanceGuid);
     }
 
     // Win32 API import for getting desktop window handle

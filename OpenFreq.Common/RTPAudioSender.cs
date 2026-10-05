@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Concentus.Enums;
@@ -19,18 +18,15 @@ namespace OpenFreq.Common;
 public class RtpAudioSender : IDisposable
 {
     private readonly ILogger<RtpAudioSender> _logger;
-    private const int OPUS_FRAME_SIZE = OpenFreqRtcClient.OPUS_SAMPLES_PER_FRAME;
-
 
     private readonly UdpClient _udpClient;
     public UdpClient UdpClient => _udpClient;
     private readonly IPEndPoint _serverEndpoint;
-    private readonly bool _opusEnabled;
 
 #pragma warning disable CS0618 // Do not use the factory - it does not work with Linux
     // VOIP mode enables SILK codec and in-band FEC (LBRR).
     private readonly OpusEncoder _opusEncoder = new OpusEncoder(
-            OpenFreqRtcClient.SAMPLE_RATE,
+            AudioFormat.SampleRate,
             1,
             OpusApplication.OPUS_APPLICATION_VOIP
         );
@@ -42,7 +38,6 @@ public class RtpAudioSender : IDisposable
     private readonly uint _ssrc;
     private readonly string _clientId;
     private const byte PAYLOAD_TYPE_OPUS = 96;
-    private const byte PAYLOAD_TYPE_PCMU = 0;
 
     // Sending Queue - now holds raw PCM data, encoding happens in the send thread
     private readonly SyncRope<short> _sendQueue = new();
@@ -57,10 +52,9 @@ public class RtpAudioSender : IDisposable
     /// <summary>
     /// Create RTP audio sender
     /// </summary>
-    public RtpAudioSender(ILogger<RtpAudioSender> logger, string serverHost, int serverPort, string clid, bool opusEnabled = true)
+    public RtpAudioSender(ILogger<RtpAudioSender> logger, string serverHost, int serverPort, string clid)
     {
         _logger = logger;
-        _opusEnabled = opusEnabled;
         _serverEndpoint = new IPEndPoint(IPAddress.Parse(serverHost), serverPort);
         _udpClient = new UdpClient();
 
@@ -82,7 +76,6 @@ public class RtpAudioSender : IDisposable
 
         _logger.LogInformation("Initialized");
         _logger.LogInformation("  Server: {ServerHost}:{ServerPort}", serverHost, serverPort);
-        _logger.LogInformation("  Opus: {OpusEnabled}", _opusEnabled);
         _logger.LogInformation("  SSRC: 0x{Ssrc:X8}", _ssrc);
     }
 
@@ -98,7 +91,7 @@ public class RtpAudioSender : IDisposable
         var packet = new RtpPacket
         {
             Version = 2,
-            PayloadType = _opusEnabled ? PAYLOAD_TYPE_OPUS : PAYLOAD_TYPE_PCMU,
+            PayloadType = PAYLOAD_TYPE_OPUS,
             SequenceNumber = 0,
             Timestamp = 0,
             Ssrc = _ssrc,
@@ -117,7 +110,7 @@ public class RtpAudioSender : IDisposable
         // Loses some precision for large dt - if timestamps are wonky,
         // consider (double)((decimal)dt / Stopwatch.Frequency)
         double dtSeconds = (double)dt / Stopwatch.Frequency;
-        double dtSamples = dtSeconds * OpenFreqRtcClient.SAMPLE_RATE;
+        double dtSamples = dtSeconds * AudioFormat.SampleRate;
         _timestamp = (uint)(dtSamples % uint.MaxValue);
     }
 
@@ -136,8 +129,8 @@ public class RtpAudioSender : IDisposable
     private void SendThreadProc()
     {
         ushort sequence = 0;
-        var drainbuf = new short[OPUS_FRAME_SIZE];
-        var encoded = new byte[OPUS_FRAME_SIZE * 2];
+        var drainbuf = new short[AudioFormat.OpusSamplesPerFrame];
+        var encoded = new byte[AudioFormat.OpusSamplesPerFrame * 2];
         var encspan = new Memory<byte>();
 
         while (true)
@@ -147,19 +140,12 @@ public class RtpAudioSender : IDisposable
 
             // Encode audio (happens here, not in audio callback)
             encspan = new Memory<byte>(encoded);
-            if (_opusEnabled)
+            var opusBytes = _opusEncoder.Encode(dspan.Span, dspan.Length, encspan.Span, encspan.Length);
+            if (opusBytes <= 0)
             {
-                var opusBytes = _opusEncoder.Encode(dspan.Span, dspan.Length, encspan.Span, encspan.Length);
-                if (opusBytes <= 0)
-                {
-                    throw new Exception("Opus encode failed");
-                }
-                encspan = encspan[..opusBytes];
+                throw new Exception("Opus encode failed");
             }
-            else
-            {
-                MemoryMarshal.AsBytes(dspan.Span).CopyTo(encspan.Span);
-            }
+            encspan = encspan[..opusBytes];
 
             // Build metadata
             var metadata = new AudioPacketMetadata
@@ -175,7 +161,7 @@ public class RtpAudioSender : IDisposable
             var rtpPacket = new RtpPacket
             {
                 Version = 2,
-                PayloadType = _opusEnabled ? PAYLOAD_TYPE_OPUS : PAYLOAD_TYPE_PCMU,
+                PayloadType = PAYLOAD_TYPE_OPUS,
                 SequenceNumber = sequence,
                 Timestamp = _timestamp,
                 Ssrc = _ssrc,
@@ -203,7 +189,7 @@ public class RtpAudioSender : IDisposable
                 // Socket closed during shutdown — exit cleanly.
                 return;
             }
-            _timestamp += OPUS_FRAME_SIZE;
+            _timestamp += AudioFormat.OpusSamplesPerFrame;
             sequence++;
         }
     }
@@ -221,7 +207,7 @@ public class RtpAudioSender : IDisposable
     public void Dispose()
     {
         _heartbeatTimer.Dispose();
-        _sendQueue.Close(); // Sentinel kills the thread
+        _sendQueue.ClearAndClose(); // Sentinel kills the thread
         _sendThread?.Join();
         _udpClient.Close();
         _udpClient.Dispose();

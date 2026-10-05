@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using OpenFreq.Client.Models;
 using OpenFreq.Common;
-using OpenFreqAudio;
 
 namespace OpenFreqClient.Services.Interfaces;
 
@@ -18,7 +17,6 @@ public interface IOpenFreqService : IDisposable
     string? PeerId { get; }
     int RecordingDeviceIndex { get; set; }
     int PlaybackDeviceIndex { get; set; }
-    int AudioParamsUpdateFrequency { get; set; }
     bool Apply3dAudioEffects { get; set; }
     bool SidetoneEnabled { get; set; }
     bool MicNormalizationEnabled { get; set; }
@@ -29,7 +27,7 @@ public interface IOpenFreqService : IDisposable
     /// <summary>Where the combined capture mix goes when recording.</summary>
     enum CaptureSink
     {
-        /// <summary>Write to an Ogg/Vorbis file.</summary>
+        /// <summary>Write to an Ogg Opus file.</summary>
         File,
         /// <summary>Stream to a separate playback device (e.g. a virtual audio cable).</summary>
         Device
@@ -41,8 +39,8 @@ public interface IOpenFreqService : IDisposable
     int MonitorDeviceIndex { get; set; }
     /// <summary>When true, capture auto-starts on entering game mode (flight) and auto-stops on leaving it.</summary>
     bool AutoRecordInGameMode { get; set; }
-    /// <summary>When true, own voice in the capture gets the full radio FX (AGC/squelch/SFX); when false it stays clean.</summary>
-    bool ApplyOwnVoiceSfx { get; set; }
+    /// <summary>Wet/dry blend (0..1) of the ambient SFX on own voice in the capture. The radio tone stays at 0.</summary>
+    double OwnVoiceSfxVolume { get; set; }
     /// <summary>Directory recordings are written to. Created if missing. Blank → "recordings" next to the executable.</summary>
     string RecordingPath { get; set; }
     /// <summary>True while a capture (file or device) is in progress.</summary>
@@ -78,18 +76,17 @@ public interface IOpenFreqService : IDisposable
     Task ConnectAsync(TimeSpan? connectTimeout = null);
     Task DisconnectAsync();
     bool IsFrequencyJoined(int frequencyKhz, Guid slotId);
+    /// <summary>Every frequency this slot currently holds. A healthy slot holds one or none.</summary>
+    IReadOnlyList<int> GetJoinedFrequencies(Guid slotId);
     Task JoinFrequencyAsync(int frequencyKhz, Guid slotId, RadioStationData radioStationData);
     Task LeaveFrequencyAsync(int frequencyKhz, Guid slotId);
-    Task StartTransmissionAsync(int frequencyKhz, Guid slotId, List<int> mutedFrequencies);
-    Task StopTransmissionAsync(int frequencyKhz);
+    Task StartTransmissionAsync(int frequencyKhz, Guid slotId);
+    Task StopTransmissionAsync(Guid slotId);
     Task UpdateDisplayNameAsync(string newDisplayName);
     Task NotifyModeAsync(bool is3d);
 
     void SetVolume(int frequencyKhz, Guid slotId, float volumeValue);
     void SetPan(int frequencyKhz, Guid slotId, int pan);
-
-    void EnableFrequency(int frequencyKhz, Guid slotId);
-    void DisableFrequency(int frequencyKhz, Guid slotId);
 
     void SetSquelch(int frequencyKhz, Guid slotId, bool isSquelchClosed);
 

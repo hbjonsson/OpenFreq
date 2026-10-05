@@ -39,21 +39,12 @@ public interface IAcmiClientService : IDisposable, ILifecycleService
     void AddTrackingForAircraft(string? objectId);
     void RemoveTrackingForAircraft(string? objectId);
 
+    /// <summary>
+    /// In-game time of day in seconds, from the stream's ReferenceTime and latest frame time.
+    /// Null until the current connection has reported both.
+    /// </summary>
+    int? GameTimeSeconds { get; }
+
 
     public AcmiConnectionStatus Status { get; }
-}
-
-/// <summary>
-/// Event args for tracked aircraft transform updates
-/// </summary>
-public class AircraftTransformEventArgs : EventArgs
-{
-    /// <summary>The aircraft's object ID</summary>
-    public string ObjectId { get; set; } = string.Empty;
-
-    /// <summary>The aircraft's current transform data</summary>
-    public AircraftTransform Transform { get; set; } = new();
-
-    /// <summary>When this update occurred</summary>
-    public DateTime Timestamp { get; set; }
 }

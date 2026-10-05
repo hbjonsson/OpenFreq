@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -33,25 +35,44 @@ public class OpenFreqService : IOpenFreqService
 
     private IRtcClient? _client;
     private int _recordHandle;
-    private readonly ConcurrentDictionary<int, List<int>> _activeTransmissionsAndMutedFrequencies = new();
 
-    private class TunedFrequencyData(RadioStationData radioStation, bool isEnabled)
+    // Our own ID and name, for our PTT lines. LogOwnPtt reads them inside the lock of _transmissions,
+    // on a different thread than the writes. A disconnect ends our transmissions, and _client can be gone then,
+    // so we keep the ID after a disconnect.
+    private volatile string? _ownPeerId;
+    private volatile string? _ownDisplayName;
+
+    // Which slots are transmitting, and on which frequency.
+    private readonly ActiveTransmissions _transmissions;
+
+    // Serializes join, leave, start and stop. Each makes its decisions about _tunedSlots and
+    // _transmissions under this lock, and hands the client whatever server messages they call for
+    // before releasing it. The client sends messages in the order it's given them, so the server
+    // sees them in the order they were decided.
+    private readonly Lock _signalingLock = new();
+
+    private class TunedFrequencyData(RadioStationData radioStation)
     {
         public RadioStationData RadioStation { get; set; } = radioStation;
-        public bool IsEnabled { get; set; } = isEnabled;
     }
 
     // Keyed by (frequencyKhz, slotId) so multiple radio sets can tune the same frequency independently.
     private readonly ConcurrentDictionary<(int FreqKhz, Guid SlotId), TunedFrequencyData> _tunedSlots = new();
 
-    // Which slotId is currently TX-ing on each frequency (needed for own-position lookup during record).
-    private readonly ConcurrentDictionary<int, Guid> _activeTransmissionSlots = new();
+    // The location whose ambient SFX the capture puts on our own voice: the last one we transmitted
+    // from, or before that, the first one we tuned. The capture plays those SFX continuously,
+    // so it needs one before we first key up.
+    private RadioStationData? _ownVoiceStation;
+    private readonly Lock _ownVoiceStationLock = new();
 
     private bool IsAnySlotTuned(int frequencyKhz) =>
         _tunedSlots.Keys.Any(k => k.FreqKhz == frequencyKhz);
 
     private TunedFrequencyData? GetAnyTunedSlot(int frequencyKhz) =>
         _tunedSlots.FirstOrDefault(kvp => kvp.Key.FreqKhz == frequencyKhz).Value;
+
+    private List<Guid> SlotsTunedTo(int frequencyKhz) =>
+        _tunedSlots.Keys.Where(k => k.FreqKhz == frequencyKhz).Select(k => k.SlotId).ToList();
 
 
     private IPlaybackService? _playbackService;
@@ -92,18 +113,34 @@ public class OpenFreqService : IOpenFreqService
     private readonly ConcurrentDictionary<(string PeerId, int FrequencyKhz), AudioParamsCacheEntry> _audioParamsCache =
         new();
 
+    // Peers whose PTT is keyed on a frequency we're on, with the display name to log them by. Heartbeats repeat
+    // "transmitting" every 333 ms, so only adding or removing an entry marks a PTT start or end.
+    private readonly ConcurrentDictionary<(string PeerId, int FrequencyKhz), string> _talkingPeers = new();
+
     // Pre-allocated sidetone conversion buffer — reused every recording callback (single-threaded).
     private float[] _sidetonePushBuffer = new float[4800]; // 100ms @ 48kHz, grows if needed
-    private readonly MicLevelNormalizer _micNormalizer = new(OpenFreqRtcClient.SAMPLE_RATE);
+    private readonly MicLevelNormalizer _micNormalizer = new(AudioFormat.SampleRate);
+
+    // TX level telemetry, accumulated across the current talk-spurt and logged once when PTT drops.
+    // Written only from the BASS record callback (single-threaded), read again after the callback
+    // has been stopped, so no locking is needed.
+    private long _txLevelSamples;
+    private double _txRawSumSquares;
+    private double _txSentSumSquares;
+    private float _txRawPeak;
+    private float _txSentPeak;
+    private int _txRawClipped; // raw samples at full scale: the input clipped before we got it
+    private bool _wasTransmitting; // whether the last callback was transmitting, to see a talk-spurt start
 
     // Cache duration - this effectively controls the rate of local physics calculations
     private readonly TimeSpan _audioParamsCacheDuration = TimeSpan.FromMilliseconds(50);
 
+    // Physics re-runs at most every _audioParamsCacheDuration while a peer holds the PTT, so a
+    // longer gap than that in the cadence means the next packet opens a new talk-spurt.
+    private static readonly TimeSpan TalkspurtGap = TimeSpan.FromMilliseconds(AudioFormat.TalkspurtGapMs);
+
     // Cache cleanup
     private CancellationTokenSource? _cleanupCts;
-
-    private const float SquelchLevelOff = 0f;
-    private const float SquelchLevelOn = 1f;
 
     private readonly IRtcClientFactory _rtcClientFactory;
     private readonly IPlaybackServiceFactory _playbackServiceFactory;
@@ -123,6 +160,14 @@ public class OpenFreqService : IOpenFreqService
         _rtcClientFactory = rtcClientFactory;
         _playbackServiceFactory = playbackServiceFactory;
         _signalCalculatorFactory = signalCalculatorFactory;
+
+        // Playback mutes whatever we're transmitting on. Pushed from inside the table's lock, so
+        // concurrent changes reach playback, and the log, in the order they happened.
+        _transmissions = new ActiveTransmissions(change =>
+        {
+            _playbackService?.SetTransmittingFrequencies(change.Frequencies);
+            LogOwnPtt(change);
+        });
 
         // Initialize signal strength tracker with callback
         _signalStrengthTracker = new SignalStrengthTracker(
@@ -146,8 +191,6 @@ public class OpenFreqService : IOpenFreqService
             _playbackService?.ChangeOutputDevice(_playbackDeviceIndex);
         }
     }
-
-    public int AudioParamsUpdateFrequency { get; set; }
 
     public bool Apply3dAudioEffects
     {
@@ -224,16 +267,16 @@ public class OpenFreqService : IOpenFreqService
     /// <summary>When true, capture auto-starts on entering game mode (flight) and auto-stops on leaving it.</summary>
     public bool AutoRecordInGameMode { get; set; }
 
-    /// <summary>When true, own voice in the capture gets the full radio FX (AGC/squelch/SFX); when false it stays clean.</summary>
-    public bool ApplyOwnVoiceSfx
+    /// <summary>Wet/dry blend (0..1) of the ambient SFX on own voice in the capture. The radio tone stays at 0.</summary>
+    public double OwnVoiceSfxVolume
     {
         get => field;
         set
         {
             field = value;
-            if (_playbackService != null) _playbackService.OwnVoiceSfxEnabled = value;
+            if (_playbackService != null) _playbackService.OwnVoiceSfxVolume = (float)value;
         }
-    } = true;
+    } = 1.0;
 
     /// <summary>Selects the capture output: file or playback device.</summary>
     public IOpenFreqService.CaptureSink Sink { get; set; } = IOpenFreqService.CaptureSink.File;
@@ -296,11 +339,13 @@ public class OpenFreqService : IOpenFreqService
             settings.OwnPositionMode == IOpenFreqService.Mode.BMS
                 ? (_falconRadioSharedMemoryService.ConnectionParameters?.Nickname ?? string.Empty)
                 : settings.DisplayName;
+        _ownDisplayName = myDisplayName;
 
         // Create client with server settings
         _logger.LogDebug("Creating new client");
         _client = _rtcClientFactory.Create(_loggerFactory,
             settings.OpenFreqServerAddress, settings.OpenFreqPassword, myDisplayName);
+        _client.GameTimeSeconds = GameTimeSeconds;
         _logger.LogDebug("Client created: {ClientHashCode}", _client.GetHashCode());
 
         // Subscribe to client events
@@ -349,7 +394,8 @@ public class OpenFreqService : IOpenFreqService
         _playbackService.SidetoneEnabled = SidetoneEnabled;
         _playbackService.SidetoneVolume = (float)SidetoneVolume;
         _playbackService.AmbientNoiseVolume = (float)AmbientNoiseVolume;
-        _playbackService.OwnVoiceSfxEnabled = ApplyOwnVoiceSfx;
+        _playbackService.OwnVoiceSfxVolume = (float)OwnVoiceSfxVolume;
+        UpdateOwnVoiceAmbient();
         _isInitialized = true;
 
         _falconSharedMemoryService.FlyingStateChanged += OnFlyingStateChanged;
@@ -424,6 +470,10 @@ public class OpenFreqService : IOpenFreqService
 
         try
         {
+            // Drop any transmissions before closing the mic, since ending the last one re-evaluates
+            // capture. The client goes away below, so there are no server stops to send.
+            EndAllTransmissionsLocally();
+
             // Stop continuous mic capture explicitly: client events are unsubscribed below
             // before the disconnect, so the event-driven close path won't run here.
             StopMicCapture();
@@ -468,6 +518,9 @@ public class OpenFreqService : IOpenFreqService
             _falconSharedMemoryService.FlyingStateChanged -= OnFlyingStateChanged;
             _falconSharedMemoryService.StateChanged -= OnFalconStateChanged;
 
+            // The client events were unsubscribed above, so OnClientConnectionStateChanged won't end these.
+            EndPeerPtts(_ => true, "we disconnected");
+
             _peerStreams.Clear();
             _isInitialized = false;
             _logger.LogDebug("Shutdown complete");
@@ -495,8 +548,40 @@ public class OpenFreqService : IOpenFreqService
     }
 
     /// <summary>
-    /// Start a combined session recording (incoming as heard + own voice rendered as if heard
-    /// from the same position) to a timestamped .ogg. No-op if already recording or the
+    /// Make <paramref name="station"/> the source of our own voice's ambient SFX in the capture,
+    /// and follow its preset from then on. With <paramref name="onlyIfUnset"/>, keep the current
+    /// station if we already have one.
+    /// </summary>
+    private void SetOwnVoiceStation(RadioStationData station, bool onlyIfUnset = false)
+    {
+        lock (_ownVoiceStationLock)
+        {
+            if (ReferenceEquals(station, _ownVoiceStation) || (onlyIfUnset && _ownVoiceStation != null)) return;
+            if (_ownVoiceStation != null) _ownVoiceStation.PropertyChanged -= OnOwnVoiceStationChanged;
+            _ownVoiceStation = station;
+            station.PropertyChanged += OnOwnVoiceStationChanged;
+        }
+
+        UpdateOwnVoiceAmbient();
+    }
+
+    private void OnOwnVoiceStationChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(RadioStationData.Preset)) UpdateOwnVoiceAmbient();
+    }
+
+    private void UpdateOwnVoiceAmbient()
+    {
+        lock (_ownVoiceStationLock)
+        {
+            if (_playbackService != null && _ownVoiceStation != null)
+                _playbackService.OwnVoiceAmbient = _ownVoiceStation.Preset.AmbientNoiseType;
+        }
+    }
+
+    /// <summary>
+    /// Start a combined session recording (incoming as heard + own voice with the radio tone)
+    /// to a timestamped Ogg Opus .ogg file. No-op if already recording or the
     /// playback subsystem is not initialized.
     /// </summary>
     public void StartRecording()
@@ -554,15 +639,22 @@ public class OpenFreqService : IOpenFreqService
         StopRecording();
 
         // Stop all transmissions
-        foreach (var frequencyKhz in _activeTransmissionsAndMutedFrequencies.Keys)
+        TransmissionChange ended;
+        Task stops;
+        lock (_signalingLock)
         {
-            await StopTransmissionAsync(frequencyKhz);
+            ended = _transmissions.EndAll();
+            stops = SendTransmissionStops(ended.Stopped);
         }
 
+        AfterTransmissionsEnded(ended);
+        await stops;
+
         await _client.DisconnectAsync();
-        _activeTransmissionsAndMutedFrequencies.Clear();
-        _activeTransmissionSlots.Clear();
-        _tunedSlots.Clear();
+        lock (_signalingLock)
+        {
+            _tunedSlots.Clear();
+        }
 
         // Stop orphaned BASS streams before clearing the tracking dict.
         // PeerLeft events may not fire on abrupt disconnects; stopping here ensures
@@ -587,6 +679,9 @@ public class OpenFreqService : IOpenFreqService
         return _tunedSlots.ContainsKey((frequencyKhz, slotId));
     }
 
+    public IReadOnlyList<int> GetJoinedFrequencies(Guid slotId) =>
+        _tunedSlots.Keys.Where(k => k.SlotId == slotId).Select(k => k.FreqKhz).ToList();
+
     /// <summary>
     /// Join a frequency channel for a specific radio slot.
     /// The signalling server is joined only on the first slot; subsequent slots on the same
@@ -606,29 +701,56 @@ public class OpenFreqService : IOpenFreqService
             return;
         }
 
-        if (_tunedSlots.ContainsKey((frequencyKhz, slotId)))
+        bool refused;
+        Task? serverJoin = null;
+        lock (_signalingLock)
         {
-            _logger.LogDebug("Not joining frequency {FrequencyKhz} slot {SlotId}, already joined", frequencyKhz, slotId);
+            if (_tunedSlots.ContainsKey((frequencyKhz, slotId)))
+            {
+                _logger.LogDebug("Not joining frequency {FrequencyKhz} slot {SlotId}, already joined", frequencyKhz,
+                    slotId);
+                return;
+            }
+
+            // Every slot on a frequency must belong to the same location. Each location hands its cards one
+            // shared RadioStationData, so a different instance means a different location. Receive physics
+            // and the record callback both take our position from any slot on the frequency, which is only
+            // right while they agree.
+            refused = _tunedSlots.Any(kvp => kvp.Key.FreqKhz == frequencyKhz &&
+                                             !ReferenceEquals(kvp.Value.RadioStation, radioStationData));
+            if (!refused)
+            {
+                var isFirstSlot = !IsAnySlotTuned(frequencyKhz);
+
+                // Set up local audio state BEFORE sending the join to the server
+                _tunedSlots.TryAdd((frequencyKhz, slotId), new TunedFrequencyData(radioStationData));
+                SetOwnVoiceStation(radioStationData, onlyIfUnset: true);
+                _signalStrengthTracker.SetSquelchState(frequencyKhz, false);
+                _playbackService?.TuneFrequency(frequencyKhz, slotId);
+
+                if (isFirstSlot) serverJoin = _client.JoinFrequencyAsync(frequencyKhz);
+            }
+        }
+
+        if (refused)
+        {
+            _logger.LogWarning(
+                "Not joining frequency {FrequencyKhz} slot {SlotId}, a card in another location already joined it",
+                frequencyKhz, slotId);
+            OnFrequencyConnectionStatusChanged(frequencyKhz, Channel.ChannelConnectionStatus.Disconnected, slotId,
+                reason: "In use by another location");
             return;
         }
 
-        var isFirstSlot = !IsAnySlotTuned(frequencyKhz);
-
-        // Set up local audio state BEFORE sending the join to the server
-        _tunedSlots.TryAdd((frequencyKhz, slotId), new TunedFrequencyData(radioStationData, true));
-        _signalStrengthTracker.SetSquelchState(frequencyKhz, false);
-        _playbackService?.TuneFrequency(frequencyKhz, slotId);
-
-        if (isFirstSlot)
+        if (serverJoin != null)
         {
-            await _client.JoinFrequencyAsync(frequencyKhz);
+            await serverJoin;
             OnStatusMessage($"Joined frequency {frequencyKhz / 1000.0:F3} MHz");
         }
-
-        if (!isFirstSlot)
+        else
         {
             // Frequency already active on server — synthesise the connected event for this slot only.
-            OnFrequencyConnectionStatusChanged(frequencyKhz, Channel.ChannelConnectionStatus.Connected, [], slotId);
+            OnFrequencyConnectionStatusChanged(frequencyKhz, Channel.ChannelConnectionStatus.Connected, slotId);
             OnStatusMessage($"Tuned frequency {frequencyKhz / 1000.0:F3} MHz (additional slot)");
         }
     }
@@ -645,22 +767,45 @@ public class OpenFreqService : IOpenFreqService
             return;
         }
 
-        // Stop transmission if this slot owns the active TX on this frequency.
-        if (_activeTransmissionSlots.TryGetValue(frequencyKhz, out var txSlotId) && txSlotId == slotId)
+        TransmissionChange ended;
+        Task stops;
+        bool wasTuned;
+        Task? serverLeave = null;
+        lock (_signalingLock)
         {
-            await StopTransmissionAsync(frequencyKhz);
+            // Stop this slot's transmission if it's on the frequency being left. A slot that has
+            // already moved to another frequency keeps transmitting there.
+            ended = _transmissions.End(slotId, onFrequencyKhz: frequencyKhz);
+            stops = SendTransmissionStops(ended.Stopped);
+
+            // Nothing else to undo for a slot that never joined, or whose join was refused. Carrying on
+            // could tell the server to leave a frequency we never joined.
+            wasTuned = _tunedSlots.TryRemove((frequencyKhz, slotId), out _);
+            if (wasTuned)
+            {
+                _playbackService?.UntuneFrequency(frequencyKhz, slotId);
+
+                if (!IsAnySlotTuned(frequencyKhz))
+                {
+                    _signalStrengthTracker.RemoveFrequency(frequencyKhz);
+                    serverLeave = _client.LeaveFrequencyAsync(frequencyKhz);
+                }
+            }
         }
 
-        // Disconnect this slot immediately (before server leave so UI updates promptly).
-        OnFrequencyConnectionStatusChanged(frequencyKhz, Channel.ChannelConnectionStatus.Disconnected, [], slotId);
+        AfterTransmissionsEnded(ended);
 
-        _tunedSlots.TryRemove((frequencyKhz, slotId), out _);
-        _playbackService?.UntuneFrequency(frequencyKhz, slotId);
-
-        if (!IsAnySlotTuned(frequencyKhz))
+        // Disconnect this slot before waiting on the server, so the UI updates promptly.
+        if (wasTuned)
         {
-            _signalStrengthTracker.RemoveFrequency(frequencyKhz);
-            await _client.LeaveFrequencyAsync(frequencyKhz);
+            OnFrequencyConnectionStatusChanged(frequencyKhz, Channel.ChannelConnectionStatus.Disconnected, slotId);
+        }
+
+        await stops;
+
+        if (serverLeave != null)
+        {
+            await serverLeave;
             OnStatusMessage($"Left frequency {frequencyKhz / 1000.0:F3} MHz");
         }
     }
@@ -668,71 +813,123 @@ public class OpenFreqService : IOpenFreqService
     /// <summary>
     /// Start transmitting on a frequency from a specific radio slot.
     /// </summary>
-    public async Task StartTransmissionAsync(int frequencyKhz, Guid slotId, List<int> mutedFrequencies)
+    public async Task StartTransmissionAsync(int frequencyKhz, Guid slotId)
     {
         if (_client == null || _playbackService == null)
         {
             throw new InvalidOperationException("Service not initialized");
         }
 
-        _tunedSlots.TryGetValue((frequencyKhz, slotId), out var tunedFrequencyData);
-        if (!tunedFrequencyData?.IsEnabled ?? false)
+        // While the client reconnects, it has no RTP sender and the server has no session for our start.
+        // A key recorded now would send audio with no start once the link came back, so refuse it.
+        // The release then has nothing to undo.
+        if (!_client.IsConnected)
         {
-            _logger.LogWarning("Trying to start transmission on disabled frequency {FrequencyKhz}", frequencyKhz);
+            _logger.LogWarning("Not transmitting on {FrequencyKhz}, not connected to the server", frequencyKhz);
             return;
         }
 
-        // Whether we're transitioning from idle → transmitting (i.e. first active TX).
-        bool wasIdle = _activeTransmissionsAndMutedFrequencies.IsEmpty;
-
-        // Add to active transmissions (TX is per-frequency; only one TX per frequency at a time)
-        _activeTransmissionsAndMutedFrequencies.TryAdd(frequencyKhz, mutedFrequencies);
-        _activeTransmissionSlots[frequencyKhz] = slotId;
-        _playbackService.AddTransmittingFrequencies(mutedFrequencies);
-
-        // Mute the noise
-        //_playbackService.SetSquelchLevel(frequency, 1.0f);
+        // Only a slot that tuned this frequency has the radio data the record callback sends with.
+        // It's checked again under the lock below; checking here too avoids opening the mic for nothing.
+        if (!_tunedSlots.ContainsKey((frequencyKhz, slotId)))
+        {
+            LogNotTuned();
+            return;
+        }
 
         // Make sure the mic stream is live. With normalization enabled it's usually already
         // open for continuous noise-floor tracking; otherwise this opens it just for the
-        // duration of the transmission.
-        if (!StartMicCapture())
+        // duration of the transmission. It opens before the transmission is recorded, so a
+        // failure leaves nothing to roll back and we never TX silence.
+        if (!StartMicCapture()) return;
+
+        TransmissionChange? change = null;
+        Task stops = Task.CompletedTask;
+        Task? serverStart = null;
+        lock (_signalingLock)
         {
-            // Couldn't open the mic — roll this transmission back so we don't TX silence.
-            _activeTransmissionsAndMutedFrequencies.TryRemove(frequencyKhz, out _);
-            _activeTransmissionSlots.TryRemove(frequencyKhz, out _);
+            // A leave may have untuned the slot since the check above.
+            if (_tunedSlots.TryGetValue((frequencyKhz, slotId), out var tuned))
+            {
+                change = _transmissions.Start(slotId, frequencyKhz);
+                SetOwnVoiceStation(tuned.RadioStation);
+
+                // On the idle → transmitting edge, mark the start time.
+                if (change.WasIdle) _client.MarkTransmitStartTime();
+
+                // The slot was transmitting on another frequency. Stop that one if no other slot holds it.
+                stops = SendTransmissionStops(change.Stopped);
+
+                // Nothing to tell the server if another slot already holds this frequency, or on a repeated start.
+                if (change.Started.Count > 0)
+                    serverStart = _client.StartTransmissionAsync(frequencyKhz, Apply3dAudioEffects);
+            }
+        }
+
+        if (change == null)
+        {
+            LogNotTuned();
+            // Close the mic again if it was opened just for this.
+            UpdateMicCaptureState();
             return;
         }
 
-        // On the idle → transmitting edge, mark the start time and arm sidetone monitoring.
-        if (wasIdle)
-        {
-            _client.MarkTransmitStartTime();
-            if (_playbackService != null) _playbackService.SidetoneEnabled = SidetoneEnabled;
-        }
+        // Arm sidetone monitoring on the idle → transmitting edge.
+        if (change.WasIdle) _playbackService.SidetoneEnabled = SidetoneEnabled;
 
-        await _client.StartTransmissionAsync(frequencyKhz, Apply3dAudioEffects);
+        await stops;
+        if (serverStart == null) return;
+
+        // No rollback if this throws: the start may already have reached the server, which shows us
+        // transmitting until it gets a stop. Leaving the slot keyed means the PTT release sends one.
+        await serverStart;
         OnStatusMessage($"Transmitting on {frequencyKhz / 1000d:F3}");
+
+        void LogNotTuned() =>
+            _logger.LogWarning("Not transmitting on {FrequencyKhz}, slot {SlotId} isn't tuned to it",
+                frequencyKhz, slotId);
     }
 
     /// <summary>
-    /// Stop transmitting on a frequency
+    /// Stop transmitting from a radio slot. No-op if the slot isn't transmitting.
     /// </summary>
-    public async Task StopTransmissionAsync(int frequencyKhz)
+    public async Task StopTransmissionAsync(Guid slotId)
     {
-        if (_client == null) return;
-
-        // Remove from active transmissions
-        _activeTransmissionsAndMutedFrequencies.TryRemove(frequencyKhz, out var mutedFrequencies);
-        _activeTransmissionSlots.TryRemove(frequencyKhz, out _);
-        if (mutedFrequencies != null)
+        TransmissionChange ended;
+        Task stops;
+        lock (_signalingLock)
         {
-            _playbackService?.RemoveTransmittingFrequencies(mutedFrequencies);
+            ended = _transmissions.End(slotId);
+            stops = SendTransmissionStops(ended.Stopped);
         }
 
+        AfterTransmissionsEnded(ended);
+        await stops;
+    }
+
+    /// <summary>
+    /// Ends every transmission without telling the server, for when the connection is gone or about to go.
+    /// </summary>
+    private void EndAllTransmissionsLocally()
+    {
+        TransmissionChange ended;
+        lock (_signalingLock)
+        {
+            ended = _transmissions.EndAll();
+        }
+
+        AfterTransmissionsEnded(ended);
+    }
+
+    /// <summary>
+    /// Local cleanup once transmissions have ended. Call it after releasing <see cref="_signalingLock"/>,
+    /// since it can open or close the mic.
+    /// </summary>
+    private void AfterTransmissionsEnded(TransmissionChange change)
+    {
         // If NO more transmissions, clear sidetone and re-evaluate capture: the mic stays open
         // for continuous noise-floor tracking when normalization is enabled, otherwise it closes.
-        if (_activeTransmissionsAndMutedFrequencies.IsEmpty)
+        if (change is { WasIdle: false, IsIdle: true })
         {
             if (_playbackService != null)
             {
@@ -742,9 +939,32 @@ public class OpenFreqService : IOpenFreqService
 
             UpdateMicCaptureState();
         }
+    }
 
-        await _client.StopTransmissionAsync(frequencyKhz, Apply3dAudioEffects);
-        OnStatusMessage($"Stopped transmitting on {frequencyKhz / 1000d:F3} MHz");
+    /// <summary>
+    /// Tells the server we've stopped transmitting on each of <paramref name="frequenciesKhz"/>. The caller
+    /// holds <see cref="_signalingLock"/>, and every stop is handed to the client before this returns, so
+    /// the stops keep their place in line. Await the result after releasing the lock.
+    /// </summary>
+    private Task SendTransmissionStops(IReadOnlyList<int> frequenciesKhz)
+    {
+        var client = _client;
+        if (client == null || frequenciesKhz.Count == 0) return Task.CompletedTask;
+
+        var stops = frequenciesKhz
+            .Select(frequencyKhz =>
+                (FrequencyKhz: frequencyKhz, Stop: client.StopTransmissionAsync(frequencyKhz, Apply3dAudioEffects)))
+            .ToList();
+        return AwaitStopsAsync();
+
+        async Task AwaitStopsAsync()
+        {
+            foreach (var (frequencyKhz, stop) in stops)
+            {
+                await stop;
+                OnStatusMessage($"Stopped transmitting on {frequencyKhz / 1000d:F3} MHz");
+            }
+        }
     }
 
     /// <summary>
@@ -753,7 +973,7 @@ public class OpenFreqService : IOpenFreqService
     /// estimator can keep tracking the room between talk-spurts).
     /// </summary>
     private bool WantMicCapture =>
-        IsConnected && (MicNormalizationEnabled || !_activeTransmissionsAndMutedFrequencies.IsEmpty);
+        IsConnected && (MicNormalizationEnabled || !_transmissions.IsEmpty);
 
     /// <summary>
     /// Opens or closes the shared mic capture stream to match <see cref="WantMicCapture"/>.
@@ -784,10 +1004,15 @@ public class OpenFreqService : IOpenFreqService
         }
 
         Bass.CurrentRecordingDevice = RecordingDeviceIndex;
-        _logger.LogDebug("RecordingDeviceIndex set to {RecordingDeviceIndex}", RecordingDeviceIndex);
+
+        // Information, not Debug: "which mic did we actually open" is the first question asked
+        // whenever a user reports that peers can't hear them, and users ship us release logs.
+        var deviceName = Bass.RecordGetDeviceInfo(RecordingDeviceIndex).Name ?? $"<unknown: {Bass.LastError}>";
+        _logger.LogInformation("Capturing from recording device (BASS index {RecordingDeviceIndex}): {DeviceName}",
+            RecordingDeviceIndex, deviceName);
 
         _recordHandle = Bass.RecordStart(
-            OpenFreqRtcClient.SAMPLE_RATE,
+            AudioFormat.SampleRate,
             1,
             BassFlags.RecordPause,
             Period: 2,
@@ -814,13 +1039,18 @@ public class OpenFreqService : IOpenFreqService
     {
         if (_recordHandle == 0) return;
 
+        // ChannelStop both stops *and* frees a recording channel — BASS has no ChannelFree, and
+        // StreamFree only accepts HSTREAM, so calling it here just logged BASS_ERROR_HANDLE
+        // against an already-freed handle on every disconnect.
         if (!Bass.ChannelStop(_recordHandle))
             _logger.LogWarning("ChannelStop on record handle {Handle} returned false: {Error}",
                 _recordHandle, Bass.LastError);
-        if (!Bass.StreamFree(_recordHandle))
-            _logger.LogWarning("StreamFree on record handle {Handle} returned false: {Error}",
-                _recordHandle, Bass.LastError);
         _recordHandle = 0;
+
+        // The callback is stopped now, so the talk-spurt accumulators are safe to read: flush a
+        // spurt that was still in flight when capture went away (disconnect mid-transmission).
+        LogTalkspurtLevel();
+        _wasTransmitting = false;
     }
 
     public async Task NotifyModeAsync(bool is3d)
@@ -833,6 +1063,7 @@ public class OpenFreqService : IOpenFreqService
     {
         if (_client is not { IsAuthenticated: true }) return;
         await _client.SetDisplayNameAsync(newDisplayName);
+        _ownDisplayName = newDisplayName;
     }
 
     public void SetVolume(int frequencyKhz, Guid slotId, float volumeValue)
@@ -843,30 +1074,6 @@ public class OpenFreqService : IOpenFreqService
     public void SetPan(int frequencyKhz, Guid slotId, int pan)
     {
         _playbackService?.SetFrequencyPan(frequencyKhz, slotId, pan);
-    }
-
-    public void EnableFrequency(int frequencyKhz, Guid slotId)
-    {
-        _tunedSlots.TryGetValue((frequencyKhz, slotId), out var tunedFrequencyData);
-        if (tunedFrequencyData == null) return;
-        tunedFrequencyData.IsEnabled = true;
-        _playbackService?.TuneFrequency(frequencyKhz, slotId);
-        OnStatusMessage($"{frequencyKhz / 1000d:F3} enabled");
-    }
-
-    public void DisableFrequency(int frequencyKhz, Guid slotId)
-    {
-        _tunedSlots.TryGetValue((frequencyKhz, slotId), out var tunedFrequencyData);
-        if (tunedFrequencyData == null) return;
-        tunedFrequencyData.IsEnabled = false;
-        // Only stop TX if this slot owns it and no other enabled slot remains.
-        if (_activeTransmissionSlots.TryGetValue(frequencyKhz, out var txSlot) && txSlot == slotId &&
-            !_tunedSlots.Any(k => k.Key.FreqKhz == frequencyKhz && k.Value.IsEnabled))
-        {
-            StopTransmissionAsync(frequencyKhz).Wait(50);
-        }
-        _playbackService?.UntuneFrequency(frequencyKhz, slotId);
-        OnStatusMessage($"{frequencyKhz / 1000d:F3} disabled");
     }
 
     public void SetSquelch(int frequencyKhz, Guid slotId, bool isSquelchClosed)
@@ -902,14 +1109,6 @@ public class OpenFreqService : IOpenFreqService
     }
 
     /// <summary>
-    /// Check if currently transmitting on a frequency
-    /// </summary>
-    public bool IsTransmitting(int frequency)
-    {
-        return _activeTransmissionsAndMutedFrequencies.ContainsKey(frequency);
-    }
-
-    /// <summary>
     /// Load heightmap for terrain-aware RF calculations
     /// </summary>
     public void LoadHeightmap(string path, int width = 32768, int height = 32768, int bytesPerSample = 2)
@@ -928,16 +1127,94 @@ public class OpenFreqService : IOpenFreqService
         return _signalCalculator?.SampleElevation(xMeters, yMeters);
     }
 
+    /// <summary>
+    /// Adds one callback's worth of samples to a running sum-of-squares and peak. Called on the
+    /// BASS record thread twice per callback (pre- and post-normalization).
+    /// </summary>
+    private static void AccumulateLevel(short[] samples, ref double sumSquares, ref float peak)
+    {
+        double sum = 0;
+        int peakRaw = 0;
+        foreach (var sample in samples)
+        {
+            int magnitude = Math.Abs((int)sample);
+            if (magnitude > peakRaw) peakRaw = magnitude;
+            double x = sample / (double)short.MaxValue;
+            sum += x * x;
+        }
+
+        sumSquares += sum;
+        var peakScaled = peakRaw / (float)short.MaxValue;
+        if (peakScaled > peak) peak = peakScaled;
+    }
+
+    /// <summary>
+    /// Counts samples at full scale. In raw mic audio, these mean the input clipped (in the ADC
+    /// or in a gain stage before us), which nothing downstream can repair.
+    /// </summary>
+    internal static int CountFullScale(ReadOnlySpan<short> samples)
+    {
+        int count = 0;
+        foreach (var sample in samples)
+        {
+            if (sample >= short.MaxValue || sample <= -short.MaxValue) count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>Linear amplitude to dBFS, floored so digital silence stays printable.</summary>
+    private static double ToDbFs(double amplitude) => amplitude > 1e-5 ? 20 * Math.Log10(amplitude) : -100;
+
+    /// <summary>
+    /// Logs peak/RMS for the talk-spurt that just ended, then resets the accumulators. No-op when
+    /// nothing was captured since the last call.
+    /// </summary>
+    private void LogTalkspurtLevel()
+    {
+        var samples = _txLevelSamples;
+        if (samples == 0) return;
+
+        var rawRms = Math.Sqrt(_txRawSumSquares / samples);
+        var sentRms = Math.Sqrt(_txSentSumSquares / samples);
+
+        _logger.LogInformation(
+            "TX for {DurationMs}ms: mic peak {RawPeak:F1} dBFS (RMS {RawRms:F1} dBFS), {RawClipped} samples clipped | " +
+            "peaked at {SentPeak:F1} dBFS (RMS {SentRms:F1} dBFS) | " +
+            "normalizer {NormalizerState}, gain {GainDb:F1} dB, gate {Gate:F1} dBFS, " +
+            "limited {LimitedPercent:F1}% samples by up to {LimitDb:F1} dB",
+            samples * 1000 / AudioFormat.SampleRate,
+            ToDbFs(_txRawPeak), ToDbFs(rawRms), _txRawClipped,
+            ToDbFs(_txSentPeak), ToDbFs(sentRms),
+            MicNormalizationEnabled ? "on" : "off",
+            20 * Math.Log10(_micNormalizer.CurrentGain), ToDbFs(_micNormalizer.NoiseGateRms),
+            100.0 * _micNormalizer.LimitedSamples / samples, _micNormalizer.MaxLimiterReductionDb);
+
+        _txLevelSamples = 0;
+        _txRawSumSquares = 0;
+        _txSentSumSquares = 0;
+        _txRawPeak = 0;
+        _txSentPeak = 0;
+        _txRawClipped = 0;
+    }
+
     private bool RecordProcedure(int handle, IntPtr buffer, int length, IntPtr user)
     {
         try
         {
+            // One snapshot for the whole callback. Reading the table twice could see the last
+            // transmission end in between, and send audio tagged with no frequencies.
+            var transmittingSlots = _transmissions.TransmittingSlots();
+
             // While not transmitting we keep the mic open purely so the normalizer can track
             // the room's noise floor. Feed those idle samples to the estimator and return —
             // nothing is sent, monitored, or recorded until PTT is held. This also freezes the
             // gate during transmission: the estimate only advances on this idle path.
-            if (_activeTransmissionsAndMutedFrequencies.Count == 0)
+            if (transmittingSlots.Count == 0)
             {
+                _wasTransmitting = false;
+                LogTalkspurtLevel();
+
                 if (MicNormalizationEnabled)
                 {
                     // Read directly from the input buffer;
@@ -955,37 +1232,30 @@ public class OpenFreqService : IOpenFreqService
                 return true;
             }
 
-            // Handle first packet - BASS accumulates audio during initialization
-            // Calculate expected size for 20ms at 48kHz, mono, 16-bit
-            // 48000 samples/sec ÷ 50 = 960 samples per 20ms
-            // 960 samples × 2 bytes/sample × 1 channel = 1920 bytes
-            int expectedBytes = (OpenFreqRtcClient.SAMPLE_RATE / 50) * 2;
-
-            // TODO: I dont think we need this anymore with the shorter dsp updates. Deactivated for now
-            expectedBytes = 10000;
-
-            if (length > expectedBytes)
+            if (!_wasTransmitting)
             {
-                _logger.LogWarning("Recording packet oversized: {Length} bytes, truncating to {ExpectedBytes}",
-                    length, expectedBytes);
-                // Option 1: Only use the LAST 20ms (most recent audio)
-                buffer = IntPtr.Add(buffer, length - expectedBytes);
-                length = expectedBytes;
-
-                // Option 2: Skip first packet entirely
-                //_isFirstPacket = false;
-                //return true;
+                _wasTransmitting = true;
+                _micNormalizer.BeginTalkspurt();
             }
 
             // Copy audio data once
             short[] audioData = new short[length / 2];
             Marshal.Copy(buffer, audioData, 0, audioData.Length);
 
+            // Measure the raw mic before normalization and the buffer again after, so a capture
+            // that only ever delivers silence can be told apart from a normalizer that ducked the
+            // audio away. Both land in one log line when the talk-spurt ends.
+            AccumulateLevel(audioData, ref _txRawSumSquares, ref _txRawPeak);
+            _txRawClipped += CountFullScale(audioData);
+
             // Normalize transmit level so loud/quiet mics land near a common
             // reference. Applied before sidetone + send so the operator hears
             // (and peers receive) the same normalized audio.
             if (MicNormalizationEnabled)
                 _micNormalizer.Process(audioData, audioData.Length);
+
+            AccumulateLevel(audioData, ref _txSentSumSquares, ref _txSentPeak);
+            _txLevelSamples += audioData.Length;
 
             // Convert mic to float once and fan out to sidetone (speaker loopback) and/or the
             // session recording (own voice, rendered through radio FX downstream).
@@ -1009,23 +1279,12 @@ public class OpenFreqService : IOpenFreqService
                 new List<(int frequencyKhz, double txPowerWatts, double ppm, Vector3? position, Vector3? velocity,
                     AmbientNoiseType ambientNoiseType)>();
 
-            // List of frequencies that got disabled in the meantime
-            var disabledFrequencies = new List<int>();
-            foreach (var transmission in _activeTransmissionsAndMutedFrequencies)
+            foreach (var (frequencyKhz, txSlotId) in transmittingSlots)
             {
-                var frequencyKhz = transmission.Key;
-                _activeTransmissionSlots.TryGetValue(frequencyKhz, out var txSlotId);
                 _tunedSlots.TryGetValue((frequencyKhz, txSlotId), out var radioStationData);
                 if (radioStationData == null)
                 {
                     _logger.LogError($"Frequency {frequencyKhz} has no RadioStationData");
-                    continue;
-                }
-
-                if (!radioStationData.IsEnabled)
-                {
-                    _logger.LogWarning($"Recording on frequency {frequencyKhz} which is not active");
-                    disabledFrequencies.Add(frequencyKhz);
                     continue;
                 }
 
@@ -1046,23 +1305,7 @@ public class OpenFreqService : IOpenFreqService
                 }
             }
 
-            // Tell the recorder how to render our own voice "as if heard from the same position":
-            // default (zero-distance) params for the transmitting radio + its ambient SFX.
-            if (wantRecord && frequenciesData.Count > 0)
-            {
-                var first = frequenciesData[0];
-                _playbackService!.SetOwnVoiceRecordParams(
-                    FastPathAudioSim.GetDefaultAudioParams(first.frequencyKhz, (float)first.ppm),
-                    first.ambientNoiseType);
-            }
-
             _client?.SendAudio(audioData, frequenciesData, Apply3dAudioEffects);
-
-            // Clean up any frequencies which might have been disabled in the meantime
-            foreach (var disabledFrequency in disabledFrequencies)
-            {
-                _activeTransmissionsAndMutedFrequencies.TryRemove(disabledFrequency, out _);
-            }
         }
         catch (Exception ex)
         {
@@ -1189,8 +1432,16 @@ public class OpenFreqService : IOpenFreqService
 
         if (e.State == ConnectionState.Disconnected)
         {
-            _tunedSlots.Clear();
-            _activeTransmissionSlots.Clear();
+            // The connection is gone, so there are no server stops to send.
+            TransmissionChange ended;
+            lock (_signalingLock)
+            {
+                ended = _transmissions.EndAll();
+                _tunedSlots.Clear();
+            }
+
+            AfterTransmissionsEnded(ended);
+            EndPeerPtts(_ => true, "we disconnected");
         }
 
         // Open continuous capture once connected (for noise-floor tracking) / close it on drop.
@@ -1201,6 +1452,7 @@ public class OpenFreqService : IOpenFreqService
 
     private void OnClientAuthenticated(object? sender, AuthenticationEventArgs e)
     {
+        _ownPeerId = e.PeerId;
         OnStatusMessage($"Authenticated - Peer ID: {e.PeerId}, Audio Port: {e.AudioPort}");
         OnAllPeersStatusUpdateReceived(sender, new AllPeersStatusEventArgs(e.Peers));
         // Push current mode to server immediately so it knows our Is3d state before
@@ -1215,14 +1467,20 @@ public class OpenFreqService : IOpenFreqService
         foreach (var peer in e.Peers)
             CreateAudioStreamForPeer(e.FrequencyKhz, peer.Id);
 
-        // Update all slots tuned to this frequency to Connected.
-        OnFrequencyConnectionStatusChanged(e.FrequencyKhz, Channel.ChannelConnectionStatus.Connected, e.Peers);
+        // Mark only the slots that actually tuned this frequency. Other channel cards can sit on the
+        // same frequency without having joined it\
+        // (BMS's 2D default, 1234, collides with our own lobby default, for example).
+        // Flipping those to Connected lets them start a transmission for a slot the
+        // audio path has no RadioStationData for.
+        foreach (var slotId in SlotsTunedTo(e.FrequencyKhz))
+            OnFrequencyConnectionStatusChanged(e.FrequencyKhz, Channel.ChannelConnectionStatus.Connected, slotId);
     }
 
     private void OnClientFrequencyLeft(object? sender, FrequencyLeftEventArgs e)
     {
         // Per-slot disconnection and playback untune are handled in LeaveFrequencyAsync.
-        // Nothing extra needed here.
+        // Off the frequency, no transmission stops arrive for the peers still talking on it.
+        EndPeerPtts(key => key.FrequencyKhz == e.FrequencyKhz, "we left the frequency");
     }
 
     private void OnClientPeerJoined(object? sender, PeerEventArgs e)
@@ -1241,7 +1499,7 @@ public class OpenFreqService : IOpenFreqService
 
         _playbackService?.StartPushStream(
             streamId,
-            OpenFreqRtcClient.SAMPLE_RATE,
+            AudioFormat.SampleRate,
             1,
             audioParams
         );
@@ -1269,6 +1527,9 @@ public class OpenFreqService : IOpenFreqService
             }
         }
 
+        // The server sends no transmission stop for a peer that leaves while keyed.
+        EndPeerPtts(key => key == (e.PeerId, e.FrequencyKhz), "left the frequency");
+
         PeerLeft?.Invoke(this, e);
     }
 
@@ -1282,6 +1543,8 @@ public class OpenFreqService : IOpenFreqService
 
     private void OnClientPeerTransmissionStatusChanged(object? sender, PeerTransmissionEventArgs e)
     {
+        LogPeerPtt(e);
+
         OnPeerActivity(this,
             new PeerActivityEventArgs(e.FrequencyKhz,
                 new PeerData(e.PeerId, e.PeerDisplayName,
@@ -1289,13 +1552,86 @@ public class OpenFreqService : IOpenFreqService
 
         // Own TX is authoritative: don't let peer state overwrite Transmitting in subscribers
         OnFrequencyTransmissionStatusChanged(e.FrequencyKhz,
-            _activeTransmissionsAndMutedFrequencies.ContainsKey(e.FrequencyKhz)
+            _transmissions.IsTransmittingOn(e.FrequencyKhz)
                 ? Channel.ChannelTransmissionStatus.Transmitting
                 : e.IsTransmitting
                     ? Channel.ChannelTransmissionStatus.Receiving
                     : Channel.ChannelTransmissionStatus.Idle,
             e.Is3d);
     }
+
+    /// <summary>
+    /// Logs a peer's PTT start or end. Only the first "transmitting" after an end is a start; the rest are heartbeats.
+    /// </summary>
+    private void LogPeerPtt(PeerTransmissionEventArgs e)
+    {
+        var key = (e.PeerId, e.FrequencyKhz);
+        if (!e.IsTransmitting)
+        {
+            EndPeerPtts(k => k == key, "released");
+            return;
+        }
+
+        // A heartbeat already on its way when we left the frequency would add an entry that never ends.
+        if (!IsAnySlotTuned(e.FrequencyKhz)) return;
+
+        if (_talkingPeers.TryAdd(key, e.PeerDisplayName))
+        {
+            _logger.LogInformation(
+                "PTT start: {PeerName} ({PeerId}) on {FreqMhz:F3} MHz, {Mode}{GameTimeSuffix}",
+                e.PeerDisplayName, e.PeerId, e.FrequencyKhz / 1000.0, e.Is3d ? "3D" : "2D",
+                GameClock.LogSuffix(GameTimeSeconds()));
+        }
+        else
+        {
+            // Keep the end line in step with a rename during the transmission.
+            _talkingPeers[key] = e.PeerDisplayName;
+        }
+    }
+
+    /// <summary>
+    /// Ends and logs the PTT of each talking peer whose key <paramref name="matches"/>.
+    /// </summary>
+    private void EndPeerPtts(Func<(string PeerId, int FrequencyKhz), bool> matches, string reason)
+    {
+        foreach (var key in _talkingPeers.Keys.Where(matches))
+        {
+            if (!_talkingPeers.TryRemove(key, out var name)) continue;
+
+            _logger.LogInformation(
+                "PTT end: {PeerName} ({PeerId}) on {FreqMhz:F3} MHz, {Reason}{GameTimeSuffix}",
+                name, key.PeerId, key.FrequencyKhz / 1000.0, reason, GameClock.LogSuffix(GameTimeSeconds()));
+        }
+    }
+
+    /// <summary>
+    /// Logs our own PTT start or end for each frequency that <paramref name="change"/> started or stopped,
+    /// with the name and ID that the server and other players log for us.
+    /// </summary>
+    private void LogOwnPtt(TransmissionChange change)
+    {
+        var gameTime = GameClock.LogSuffix(GameTimeSeconds());
+        var name = DisplayNames.ForLog(_ownDisplayName);
+        var peerId = _ownPeerId;
+
+        foreach (var frequencyKhz in change.Started)
+            _logger.LogInformation("PTT start: {PeerName} ({PeerId}) on {FreqMhz:F3} MHz{GameTimeSuffix}",
+                name, peerId, frequencyKhz / 1000.0, gameTime);
+
+        foreach (var frequencyKhz in change.Stopped)
+            _logger.LogInformation("PTT end: {PeerName} ({PeerId}) on {FreqMhz:F3} MHz{GameTimeSuffix}",
+                name, peerId, frequencyKhz / 1000.0, gameTime);
+    }
+
+    /// <summary>
+    /// In-game time of day in seconds, from the source we also take our position from: BMS shared memory in
+    /// BMS mode, the Tacview stream in GCI mode. Null when that source has no time. Neither source takes a
+    /// lock, which matters because callers can hold <see cref="_signalingLock"/> or the lock inside
+    /// <see cref="_transmissions"/>.
+    /// </summary>
+    private int? GameTimeSeconds() => OwnPositionMode == IOpenFreqService.Mode.BMS
+        ? _falconSharedMemoryService.GameTimeSeconds
+        : _acmiClientService.GameTimeSeconds;
 
     /// <summary>
     /// Route received audio to playback service with RF effects
@@ -1325,7 +1661,7 @@ public class OpenFreqService : IOpenFreqService
                 continue;
             }
 
-            if (Apply3dAudioEffects && _activeTransmissionsAndMutedFrequencies.ContainsKey(frequencyTransmission.Khz))
+            if (Apply3dAudioEffects && _transmissions.IsTransmittingOn(frequencyTransmission.Khz))
             {
                 _logger.LogDebug("Receiving transmission when we are sending - dropping");
                 continue;
@@ -1335,7 +1671,7 @@ public class OpenFreqService : IOpenFreqService
 
             // Calculate audio params - always sync when 3D enabled, default otherwise
             var audioParams = Apply3dAudioEffects
-                ? CalculateAudioParamsSync(frequencyTransmission, e.PeerId)
+                ? CalculateAudioParamsSync(frequencyTransmission, e.PeerId, e.Metadata.DisplayName)
                 : FastPathAudioSim.GetDefaultAudioParams(frequencyTransmission.Khz);
 
             lock (_streamCreationLock)
@@ -1350,7 +1686,7 @@ public class OpenFreqService : IOpenFreqService
 
                     _playbackService?.StartPushStream(
                         streamId,
-                        OpenFreqRtcClient.SAMPLE_RATE,
+                        AudioFormat.SampleRate,
                         1,
                         audioParams);
 
@@ -1382,12 +1718,21 @@ public class OpenFreqService : IOpenFreqService
         }
     }
 
-    private AudioParams CalculateAudioParamsSync(FrequencyTransmission frequencyTransmission, string peerId)
+    private AudioParams CalculateAudioParamsSync(FrequencyTransmission frequencyTransmission, string peerId,
+        string? peerName)
     {
         var cacheKey = (peerId, frequencyTransmission.Khz);
+        var nowTicks = Stopwatch.GetTimestamp();
+        _audioParamsCache.TryGetValue(cacheKey, out var cached);
 
-        // All slots on the same frequency share the same RadioStationData (position/velocity).
-        // Pick any tuned slot's key for position lookup.
+        // Physics only re-runs while audio is flowing, so a stale (or evicted) entry means this
+        // packet opens a new talk-spurt - someone just keyed up. Worth a line of RF telemetry, and
+        // reading the edge off the cache timestamp keeps it free of any state of its own.
+        var newTalkspurt = cached == null ||
+                           Stopwatch.GetElapsedTime(cached.LastCalculatedTicks, nowTicks) > TalkspurtGap;
+
+        // All slots on the same frequency share the same RadioStationData (position/velocity), since
+        // JoinFrequencyAsync refuses slots from another location. Pick any tuned slot's key for position lookup.
         var anySlotKey = _tunedSlots.Keys.FirstOrDefault(k => k.FreqKhz == frequencyTransmission.Khz);
         var ownPosition = anySlotKey != default ? GetOwnPosition(anySlotKey.FreqKhz, anySlotKey.SlotId) : null;
         var ownVelocity = anySlotKey != default ? GetOwnVelocity(anySlotKey.FreqKhz, anySlotKey.SlotId) : null;
@@ -1401,10 +1746,8 @@ public class OpenFreqService : IOpenFreqService
         }
 
         // Check cache
-        var now = DateTime.UtcNow;
-
-        if (_audioParamsCache.TryGetValue(cacheKey, out var cached) &&
-            (now - cached.LastCalculated) < _audioParamsCacheDuration)
+        if (cached != null &&
+            Stopwatch.GetElapsedTime(cached.LastCalculatedTicks, nowTicks) < _audioParamsCacheDuration)
         {
             return cached.Params;
         }
@@ -1430,18 +1773,92 @@ public class OpenFreqService : IOpenFreqService
             rxVelocity: ownVelocity?.ToTuple()
         );
 
+        // Refuse NaN or infinite physics output and keep playing the last good result.
+        // A single NaN SNR latches that radio's squelch shut until reconnect (the 1.1.0 F-15 bug).
+        if (!IsFinite(audioParams))
+        {
+            // Log once per run of bad results, not every time physics re-runs.
+            if (cached is not { Rejected: true })
+            {
+                LogNonFiniteAudioParams(peerId, frequencyTransmission, ownPosition, ownVelocity,
+                    receiverSensitivityDb, audioParams);
+            }
+
+            var lastGood = LastKnownOrDefaultAudioParams(cacheKey, frequencyTransmission.Khz);
+            // Cache the refusal too, so physics keeps its usual rate instead of re-running every packet.
+            _audioParamsCache[cacheKey] = new AudioParamsCacheEntry
+            {
+                Params = lastGood,
+                LastCalculatedTicks = nowTicks,
+                Rejected = true
+            };
+            return lastGood;
+        }
+
         // Update cache
         _audioParamsCache[cacheKey] = new AudioParamsCacheEntry
         {
             Params = audioParams,
-            LastCalculated = now
+            LastCalculatedTicks = nowTicks
         };
+
+        if (newTalkspurt)
+            LogTalkspurtSignal(peerId, peerName, frequencyTransmission, ownPosition, audioParams);
 
 #if DEBUG
         _logger.LogDebug("Calculated audio params {AudioParams}", audioParams);
 #endif
 
         return audioParams;
+    }
+
+    /// <summary>
+    /// One line per incoming talk-spurt with the RF budget that decided whether it was audible:
+    /// received level, SNR, and the two dominant loss terms. Terrain diffraction is altitude-gated,
+    /// so the range and both MSL altitudes are what make a tester's log bucketable after the fact.
+    /// The talker's name and the game time let it be matched to PTT lines and in-game recordings.
+    /// Counterpart to <see cref="LogTalkspurtLevel"/> on the send side.
+    /// </summary>
+    private void LogTalkspurtSignal(string peerId, string? peerName, FrequencyTransmission tx, Vector3 rxPosition,
+        AudioParams audioParams)
+    {
+        // Both positions are MSL - that is how they go into CalculateAudioParams above.
+        var dx = rxPosition.X - tx.Position!.X;
+        var dy = rxPosition.Y - tx.Position.Y;
+        var dz = rxPosition.Z - tx.Position.Z;
+        var rangeKm = Math.Sqrt(dx * dx + dy * dy + dz * dz) / 1000.0;
+
+        _logger.LogInformation(
+            "RX {FreqMhz:F3} MHz from {PeerName} ({PeerId}){GameTimeSuffix}: " +
+            "{ReceivedDb:F1} dBm, SNR {SnrDb:F1} dB, " +
+            "FSPL {FsplDb:F1} dB, terrain {TerrainDb:F1} dB, " +
+            "{RangeKm:F1} km, tx {TxAlt:F0} m / rx {RxAlt:F0} m MSL",
+            tx.Khz / 1000.0, peerName ?? "Unnamed", peerId, GameClock.LogSuffix(GameTimeSeconds()),
+            audioParams.ReceivedDb, audioParams.ReceivedSnrDb,
+            audioParams.FreeSpaceLossDb, audioParams.TerrainLossDb,
+            rangeKm, tx.Position.Z, rxPosition.Z);
+    }
+
+    private static bool IsFinite(AudioParams p) =>
+        float.IsFinite(p.ReceivedDb) && float.IsFinite(p.ReceivedSnrDb) &&
+        float.IsFinite(p.FreeSpaceLossDb) && float.IsFinite(p.TerrainLossDb) &&
+        float.IsFinite(p.TuneOffsetPPM);
+
+    /// <summary>
+    /// Physics produced a NaN or infinity. Print every parameter, plus every input that went into
+    /// the calculation, so the geometry can be replayed.
+    /// </summary>
+    private void LogNonFiniteAudioParams(string peerId, FrequencyTransmission tx, Vector3 rxPosition,
+        Vector3? rxVelocity, double rxSensitivityDbm, AudioParams p)
+    {
+        _logger.LogError(
+            "Rejected non-finite audio params for {FreqMhz:F3} MHz from {PeerId}, keeping the last good ones: " +
+            "ReceivedDb {ReceivedDb}, ReceivedSnrDb {ReceivedSnrDb}, FreeSpaceLossDb {FreeSpaceLossDb}, " +
+            "TerrainLossDb {TerrainLossDb}, TuneOffsetPPM {TuneOffsetPpm}. Inputs: tx position {TxPosition} m, tx velocity {TxVelocity} m/s, " +
+            "{TxPowerWatts} W, {Ppm} ppm; rx position {RxPosition} m, rx velocity {RxVelocity} m/s, " +
+            "rx sensitivity {RxSensitivityDbm} dBm",
+            tx.Khz / 1000.0, peerId, p.ReceivedDb, p.ReceivedSnrDb, p.FreeSpaceLossDb, p.TerrainLossDb, p.TuneOffsetPPM,
+            tx.Position, tx.Velocity, tx.TxPowerWatts, tx.Ppm, rxPosition, rxVelocity, rxSensitivityDbm);
     }
 
     // Last computed physics params for this source+freq, ignoring the cache freshness.
@@ -1460,9 +1877,10 @@ public class OpenFreqService : IOpenFreqService
         {
             while (await timer.WaitForNextTickAsync(cancellationToken))
             {
-                var cutoff = DateTime.UtcNow - TimeSpan.FromSeconds(30);
+                var nowTicks = Stopwatch.GetTimestamp();
+                var ttl = TimeSpan.FromSeconds(30);
                 var keysToRemove = _audioParamsCache
-                    .Where(kvp => kvp.Value.LastCalculated < cutoff)
+                    .Where(kvp => Stopwatch.GetElapsedTime(kvp.Value.LastCalculatedTicks, nowTicks) > ttl)
                     .Select(kvp => kvp.Key)
                     .ToList();
 
@@ -1489,11 +1907,11 @@ public class OpenFreqService : IOpenFreqService
         StatusMessageReceived?.Invoke(this, message);
 
     private void OnFrequencyConnectionStatusChanged(int frequencyKhz, Channel.ChannelConnectionStatus connectionStatus,
-        List<ChannelStateMessage.Peer> peers, Guid? slotId = null)
+        Guid slotId, string? reason = null)
     {
         _logger.LogDebug("Frequency {FrequencyKhz}: {Status}", frequencyKhz, connectionStatus);
         FrequencyConnectionStatusChanged?.Invoke(this,
-            new FrequencyConnectionStatusEventArgs(frequencyKhz, connectionStatus, peers, slotId));
+            new FrequencyConnectionStatusEventArgs(frequencyKhz, connectionStatus, slotId, reason));
     }
 
     private void OnFrequencyTransmissionStatusChanged(int frequencyKhz,
@@ -1517,8 +1935,8 @@ public class OpenFreqService : IOpenFreqService
         _cleanupCts?.Dispose();
 
         // Stop all transmissions and free the recording handle
+        EndAllTransmissionsLocally();
         StopMicCapture();
-        _activeTransmissionsAndMutedFrequencies.Clear();
 
         _playbackService?.StopAll();
         _signalCalculator?.Dispose();
@@ -1550,15 +1968,16 @@ public class OpenFreqService : IOpenFreqService
 public class FrequencyConnectionStatusEventArgs(
     int frequencyKhz,
     Channel.ChannelConnectionStatus connectionStatus,
-    List<ChannelStateMessage.Peer> peers,
-    Guid? slotId = null)
+    Guid slotId,
+    string? reason = null)
     : EventArgs
 {
     public int FrequencyKhz { get; } = frequencyKhz;
     public Channel.ChannelConnectionStatus ConnectionStatus { get; } = connectionStatus;
-    public List<ChannelStateMessage.Peer> Peers = peers;
-    /// <summary>When set, only the channel with this Id should be updated; null means all channels on the frequency.</summary>
-    public Guid? SlotId { get; } = slotId;
+    /// <summary>The radio slot this status applies to; only the channel with this Id is updated.</summary>
+    public Guid SlotId { get; } = slotId;
+    /// <summary>Why the slot isn't connected, for display on its card. Null when there's nothing to explain.</summary>
+    public string? Reason { get; } = reason;
 }
 
 public class FrequencyTransmissionStatusEventArgs(
@@ -1582,5 +2001,9 @@ public class PeerActivityEventArgs(int frequencyKhz, PeerData peerData, bool is3
 internal class AudioParamsCacheEntry
 {
     public required AudioParams Params { get; set; }
-    public DateTime LastCalculated { get; set; }
+
+    public long LastCalculatedTicks { get; set; }
+
+    // The last calculation was non-finite and refused. Params still holds the last good result.
+    public bool Rejected { get; set; }
 }

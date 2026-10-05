@@ -15,7 +15,6 @@ using FalconBmsDataService.Services;
 using FalconRadioService.Models;
 using FalconRadioService.Services;
 using Microsoft.Extensions.Logging;
-using NetTopologySuite.Index.Quadtree;
 using OpenFreq.Client.Models;
 using OpenFreq.Common;
 using OpenFreq.Services.Acmi;
@@ -39,9 +38,16 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
     private readonly SettingsViewModel _settings;
 
     private const string BmsLocationName = "BMS Channels";
-    public LocationViewModel? FalconLocation { get; private set; }
+    public LocationViewModel? FalconLocation { get; internal set; }
 
     private readonly Lock _channelImportLock = new();
+
+    private readonly Lock _bmsPttLock = new();
+    private Task _bmsPttTail = Task.CompletedTask;
+
+    // One chain per BMS radio slot, so switches of the same slot run in the order the RCC loop saw them.
+    private readonly Lock _slotSwitchLock = new();
+    private readonly Dictionary<RadioType, Task> _slotSwitchTails = new();
 
     // Last-logged BMS volume signature — dedupes the volume diagnostic so it only
     // logs when raw/gain values actually change (no per-poll spam).
@@ -187,10 +193,10 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
                 AltitudeFt = 30000
             });
 
-        var lobby1 = location.CreateChannel(1234, "BMS Lobby 1", false);
+        var lobby1 = location.CreateChannel(339750, "BMS Lobby 1", false);
         lobby1.PttHotKey = new KeyboardBinding(KeyCode.VcF1);
 
-        var lobby2 = location.CreateChannel(339750, "BMS Lobby 2", false);
+        var lobby2 = location.CreateChannel(1234, "BMS Lobby 2", false);
         lobby2.PttHotKey = new KeyboardBinding(KeyCode.VcF2);
 
         SelectedLocation = location;
@@ -203,18 +209,7 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
         if (e == ConnectionState.Authenticated && !_settings.ModeIsGci)
         {
             _logger.LogDebug("OpenFreq authenticated, importing and joining BMS channels");
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await ImportBmsRadioChannels();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to import/join BMS channels");
-                }
-            });
+            StartBmsImport();
         }
         else if (e == ConnectionState.Authenticated && _settings.ModeIsGci)
         {
@@ -230,19 +225,17 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
 
     private static float ComputeGainFromBmsVolume(int rawVolume)
     {
-        // BMS knob: ~600 = loudest, 10000 = mute (inverted scale).
-        // Floor set slightly below the loudest reading (600) so the very top of the knob reliably hits max gain
-        const float dxMin = 600f;
-        const float dxMax = 10000f;
-        // Calibrated empirically to the BMS *AI-voice* loudness curve - the BMS volume knob acts as an overall-volume control, so we match the active-RMS of BMS recordings at matched knob position
-        const float dbMin = -88.75f;
-        const float dbMax = 2.0f;
+        // BMS knob: 0 = loudest, 10000 = mute (inverted scale).
+        const double dxMin = 0f;
+        const double dxMax = 10000f;
 
-        var clampedDx = Math.Clamp(rawVolume, dxMin, dxMax);
-        var t = (dxMax - clampedDx) / (dxMax - dxMin);
-        var db = dbMin + t * (dbMax - dbMin);
-        var gain = (float)Math.Pow(10.0, db / 20.0);
-        return gain < 0.00001f ? 0f : gain;
+        const double dbMin = -40f;
+        const double dbMax = 6f;
+
+        double clampedDx = Math.Clamp(rawVolume, dxMin, dxMax);
+        double t = (dxMax - clampedDx) / (dxMax - dxMin);
+        double db = dbMin + t * (dbMax - dbMin);
+        return (float)Math.Pow(10.0, db / 20.0);
     }
 
     private void OnRadioVolumeChanged(object? sender, RadioVolumeChangedEventArgs e)
@@ -264,25 +257,7 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
         }
     }
 
-    private void OnRadioPowerChanged(object? sender, RadioPowerChangedEventArgs e)
-    {
-        if (_settings.ModeIsGci || FalconLocation == null) return;
-
-        var channels = FalconLocation.Channels.Where(c => c.BmsRadioType == e.RadioType).ToList();
-        foreach (var channel in channels)
-        {
-            // Skip 9999 - it's BMS's parking frequency and should never be joined
-            if (channel.FrequencyKhz == IFalconRadioSharedMemoryService.BmsRadioOffFrequency)
-                continue;
-
-            // Trigger Join/Leave
-            if (!e.NewPower && channel.ConnectionStatus == Channel.ChannelConnectionStatus.Connected ||
-                e.NewPower && channel.ConnectionStatus != Channel.ChannelConnectionStatus.Connected)
-            {
-                channel.ToggleJoinLeave();
-            }
-        }
-    }
+    private void OnRadioPowerChanged(object? sender, RadioPowerChangedEventArgs e) => QueueSlotSwitch(e.RadioType);
 
     private async void OnConnectionParametersChanged(object? sender,
         ConnectionParametersChangedEventArgs e)
@@ -311,19 +286,7 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
     {
         if (FalconLocation == null) return;
         foreach (var type in Enum.GetValues<RadioType>())
-        {
-            var radioChannel = _falconRadioSharedMemoryService.GetRadioChannel(type);
-            if (radioChannel == null) continue;
-            var isPowerOn = radioChannel.IsOn &&
-                            radioChannel.Frequency != IFalconRadioSharedMemoryService.BmsRadioOffFrequency;
-            foreach (var channel in FalconLocation.Channels.Where(c => c.BmsRadioType == type).ToList())
-            {
-                if (channel.FrequencyKhz == IFalconRadioSharedMemoryService.BmsRadioOffFrequency) continue;
-                var isConnected = channel.ConnectionStatus == Channel.ChannelConnectionStatus.Connected;
-                if (isPowerOn != isConnected)
-                    channel.ToggleJoinLeave();
-            }
-        }
+            QueueSlotSwitch(type);
 
         SyncBmsChannelVolumeStates();
     }
@@ -334,7 +297,8 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
         foreach (var type in Enum.GetValues<RadioType>())
         {
             var radioChannel = _falconRadioSharedMemoryService.GetRadioChannel(type);
-            if (radioChannel == null || radioChannel.RxVolume <= 0) continue;
+            // BMS scales RxVolume from 0, the loudest, to 10000, the quietest.
+            if (radioChannel == null || radioChannel.RxVolume < 0) continue;
             var gain = ComputeGainFromBmsVolume(radioChannel.RxVolume);
             foreach (var channel in FalconLocation.Channels.Where(c => c.BmsRadioType == type).ToList())
             {
@@ -379,87 +343,107 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
         {
             _hotkeyService.ResumePttKeys();
         }
+
+        // Entering and leaving 3D both swap every radio between the UI presets and the cockpit radios.
+        foreach (var type in Enum.GetValues<RadioType>())
+            QueueSlotSwitch(type);
     }
 
+    /// <summary>
+    /// Runs <see cref="ImportBmsRadioChannels"/> on the thread pool. Its callers handle events on threads that must
+    /// not block: the WebSocket receive loop and the RCC polling loop.
+    /// </summary>
+    private void StartBmsImport()
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await ImportBmsRadioChannels();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to import/join BMS channels");
+            }
+        });
+    }
+
+    /// <summary>
+    /// Makes sure the BMS location has one card per radio slot, then switches each slot to the state BMS reports now.
+    /// </summary>
+    /// <remarks>
+    /// The cards are built once per BMS session, and a reconnect keeps them. OpenFreqService holds its slots by card
+    /// ID, so a new card would leave the old slot joined (and transmitting, if it was) with no card that can reach it.
+    /// The RTC client rejoins the frequencies itself.
+    /// </remarks>
     private async Task ImportBmsRadioChannels()
     {
-        await Dispatcher.UIThread.InvokeAsync(() =>
+        if (FalconLocation == null)
+            await Dispatcher.UIThread.InvokeAsync(CreateBmsLocation);
+
+        // Tune and join each slot from the state BMS reports right now. After a reconnect, this also applies
+        // the changes that switches dropped while the client wasn't authenticated.
+        foreach (var type in Enum.GetValues<RadioType>())
+            QueueSlotSwitch(type);
+
+        // Apply current BMS volume levels — SyncBmsChannelPowerStates (which calls
+        // SyncBmsChannelVolumeStates) only fires on ReadyToTransmit false→true transition.
+        // When ReadyToTransmit stays true across a reconnect that transition never fires,
+        // so we sync volumes explicitly here.
+        SyncBmsChannelVolumeStates();
+    }
+
+    private void CreateBmsLocation()
+    {
+        lock (_channelImportLock)
         {
-            lock (_channelImportLock)
+            // Another import built it first.
+            if (FalconLocation != null) return;
+
+            FalconLocation = CreateLocation(BmsLocationName, RadioStationPresets.FighterF16,
+                RadioStationData.RadioStationType.BMS);
+
+            // One card per radio slot, always. Two radios on one frequency are a normal BMS state,
+            // so the cards must never be merged or dropped: the slot, not the frequency, is the identity.
+            foreach (var type in Enum.GetValues<RadioType>())
             {
-                if (FalconLocation == null)
+                var falconChannel = _falconRadioSharedMemoryService.GetRadioChannel(type);
+                var channelName = type switch
                 {
-                    FalconLocation = CreateLocation(BmsLocationName, RadioStationPresets.FighterF16,
-                        RadioStationData.RadioStationType.BMS);
-                }
-                else
+                    RadioType.Radio1 => "Radio 1",
+                    RadioType.Radio2 => "Radio 2",
+                    RadioType.Guard => "Guard",
+                    _ => type.ToString()
+                };
+                var channel = FalconLocation.CreateChannel(falconChannel?.Frequency ?? 0,
+                    channelName,
+                    false, type);
+                channel.IsEditable = false;
+
+                // set hotkeys and Pan from Settings
+                switch (type)
                 {
-                    FalconLocation.LeaveAllChannelsAsync().Wait(300);
-                    FalconLocation.Channels.Clear();
-                }
-
-                // Create the Channels
-                foreach (var type in Enum.GetValues<RadioType>())
-                {
-                    var falconChannel = _falconRadioSharedMemoryService.GetRadioChannel(type);
-                    if (falconChannel != null &&
-                        FalconLocation.Channels.All(c => c.FrequencyKhz != falconChannel.Frequency))
-                    {
-                        var channelName = type switch
-                        {
-                            RadioType.Radio1 => "Radio 1",
-                            RadioType.Radio2 => "Radio 2",
-                            RadioType.Guard => "Guard",
-                            _ => type.ToString()
-                        };
-                        var channel = FalconLocation.CreateChannel(falconChannel.Frequency,
-                            channelName,
-                            false, type);
-                        channel.IsEditable = false;
-
-                        var channelIsPowerOn = _falconRadioSharedMemoryService.GetRadioChannel(type)?.IsOn ?? false;
-                        _logger.LogDebug($"CHANNEL {channel.FrequencyKhz}: {channelIsPowerOn}");
-                        if (channelIsPowerOn)
-                        {
-                            channel.Join();
-                        }
-                        else
-                        {
-                            channel.Leave();
-                        }
-
-                        // set hotkeys and Pan from Settings
-                        switch (type)
-                        {
-                            case RadioType.Radio1:
-                                channel.PttHotKey = new KeyboardBinding(KeyCode.VcF1);
-                                channel.SquelchHotKey = _settings.BmsUhfSquelchHotkey;
-                                channel.Pan = _settings.BmsRadio1Pan;
-                                break;
-                            case RadioType.Radio2:
-                                channel.PttHotKey = new KeyboardBinding(KeyCode.VcF2);
-                                channel.SquelchHotKey = _settings.BmsVhfSquelchHotkey;
-                                channel.Pan = _settings.BmsRadio2Pan;
-                                break;
-                            case RadioType.Guard:
-                                channel.PttHotKey = new KeyboardBinding(KeyCode.VcF3);
-                                channel.SquelchHotKey = _settings.BmsUhfSquelchHotkey;
-                                channel.Pan = _settings.BmsRadio1Pan;
-                                break;
-                            default:
-                                _logger.LogWarning("Unknown radio type: " + type);
-                                break;
-                        }
-                    }
+                    case RadioType.Radio1:
+                        channel.PttHotKey = new KeyboardBinding(KeyCode.VcF1);
+                        channel.SquelchHotKey = _settings.BmsUhfSquelchHotkey;
+                        channel.Pan = _settings.BmsRadio1Pan;
+                        break;
+                    case RadioType.Radio2:
+                        channel.PttHotKey = new KeyboardBinding(KeyCode.VcF2);
+                        channel.SquelchHotKey = _settings.BmsVhfSquelchHotkey;
+                        channel.Pan = _settings.BmsRadio2Pan;
+                        break;
+                    case RadioType.Guard:
+                        channel.PttHotKey = new KeyboardBinding(KeyCode.VcF3);
+                        channel.SquelchHotKey = _settings.BmsUhfSquelchHotkey;
+                        channel.Pan = _settings.BmsRadio1Pan;
+                        break;
+                    default:
+                        _logger.LogWarning("Unknown radio type: " + type);
+                        break;
                 }
             }
-
-            // Apply current BMS volume levels — SyncBmsChannelPowerStates (which calls
-            // SyncBmsChannelVolumeStates) only fires on ReadyToTransmit false→true transition.
-            // When ReadyToTransmit stays true across a reconnect that transition never fires,
-            // so we sync volumes explicitly here after the channel list is built.
-            SyncBmsChannelVolumeStates();
-        });
+        }
     }
 
     private void OnBmsPttChanged(object? sender, RadioPttChangedEventArgs e)
@@ -476,16 +460,48 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
 
         var channel = FalconLocation.Channels.FirstOrDefault(c => c.BmsRadioType == e.RadioType);
         if (channel == null || channel.ConnectionStatus == Channel.ChannelConnectionStatus.Disconnected) return;
+
+        // Read the frequency now. A retune can change it before the queued start runs.
+        var frequencyKhz = channel.FrequencyKhz;
+        var slotId = channel.Id;
         switch (e)
         {
-            // mute only the transmitting frequency
             case { OldPtt: false, NewPtt: true }:
-                var mutedFrequencies = new List<int> { channel.FrequencyKhz };
-                _openFreqService.StartTransmissionAsync(channel.FrequencyKhz, channel.Id, mutedFrequencies).Wait();
+                QueueBmsPtt(e.RadioType, "start", () => _openFreqService.StartTransmissionAsync(frequencyKhz, slotId));
                 break;
             case { OldPtt: true, NewPtt: false }:
-                _openFreqService.StopTransmissionAsync(channel.FrequencyKhz).Wait();
+                QueueBmsPtt(e.RadioType, "stop", () => _openFreqService.StopTransmissionAsync(slotId));
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Runs BMS PTT changes on the thread pool, one at a time, in the order that the RCC polling loop saw them.
+    /// If the polling loop waited for each websocket send, it would read the next PTT change late.
+    /// </summary>
+    /// <remarks>
+    /// Each change waits until the previous change is complete, not only until it has started. The RTC client raises
+    /// <see cref="IRtcClient.TransmissionStateChanged"/> after each send completes. If a start and a stop overlap,
+    /// those events can arrive in the wrong order, and the card then stays in the transmitting status.
+    /// </remarks>
+    private void QueueBmsPtt(RadioType radioType, string action, Func<Task> change)
+    {
+        lock (_bmsPttLock)
+        {
+            var previous = _bmsPttTail;
+            _bmsPttTail = Task.Run(async () =>
+            {
+                // This never throws, because each change catches its own exception.
+                await previous;
+                try
+                {
+                    await change();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "BMS PTT {Action} on {RadioType} failed", action, radioType);
+                }
+            });
         }
     }
 
@@ -495,102 +511,97 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
         if (FalconLocation == null)
         {
             _logger.LogWarning("Unclean state: FalconLocation is null, reimporting");
-            ImportBmsRadioChannels().Wait(100);
+            StartBmsImport();
             return;
         }
 
-        _logger.LogDebug(
-            $"OnBmsFrequencyChanged: {e.OldFrequencyKhz} -> {e.NewFrequencyKhz}");
+        QueueSlotSwitch(e.RadioType);
+    }
 
+    /// <summary>
+    /// Queues one switch of a BMS radio slot to the frequency and power state that BMS reports for it now.
+    /// </summary>
+    /// <remarks>
+    /// Each radio slot gets its own chain, and a switch waits for the previous switch of that slot to finish.
+    /// Without that, a ramp start defeats us: it walks the radio through several presets in under a second,
+    /// and two overlapping switches can leave the card on one frequency while the server holds the slot on
+    /// another. The card frequency drives transmit and the server membership drives receive, so the pilot
+    /// is then heard but hears nothing back.
+    /// </remarks>
+    private void QueueSlotSwitch(RadioType radioType)
+    {
+        if (_settings.ModeIsGci) return;
 
-        lock (_channelImportLock)
+        var location = FalconLocation;
+        if (location == null) return;
+
+        var radio = _falconRadioSharedMemoryService.GetRadioChannel(radioType);
+        if (radio == null) return;
+
+        var card = location.Channels.FirstOrDefault(c => c.BmsRadioType == radioType);
+        if (card == null)
         {
-            // make sure we set the power correctly
-            var channelIsPowerOn = _falconRadioSharedMemoryService.GetRadioChannel(e.RadioType)?.IsOn ?? false;
+            _logger.LogWarning("No card for {RadioType}, cannot tune it to {FrequencyKhz} kHz",
+                radioType, radio.Frequency);
+            return;
+        }
 
-            // Try to change an existing frequency - this should be the case in 99% of the time
-            if (FalconLocation.ChangeChannelFrequency(e.OldFrequencyKhz, e.NewFrequencyKhz, channelIsPowerOn))
+        var frequencyKhz = radio.Frequency;
+        var powerOn = radio.IsOn;
+        var shouldJoin = powerOn && !IFalconRadioSharedMemoryService.IsBmsParkingFrequency(frequencyKhz);
+
+        lock (_slotSwitchLock)
+        {
+            var previous = _slotSwitchTails.GetValueOrDefault(radioType, Task.CompletedTask);
+            _slotSwitchTails[radioType] = Task.Run(async () =>
             {
-                // Explicitly join the channel that was just updated if it's powered on
-                // 9999 is BMS's "radio off" parking frequency - never join it
-                var updatedChannel =
-                    FalconLocation.Channels.FirstOrDefault(c => c.BmsRadioType == e.RadioType);
-                if (updatedChannel != null && channelIsPowerOn &&
-                    e.NewFrequencyKhz != IFalconRadioSharedMemoryService.BmsRadioOffFrequency)
+                // This never throws, because each switch catches its own exception.
+                await previous;
+                try
                 {
-                    _logger.LogDebug($"Explicitly joining updated channel: {e.NewFrequencyKhz}");
-                    updatedChannel.Join();
-                    _openFreqService.SetPan(e.NewFrequencyKhz, updatedChannel.Id, updatedChannel.Pan);
-                }
+                    // A reimport clears the card list and builds new cards. Anything queued before that
+                    // must not act on a discarded card, or it would join a frequency for a slot that no
+                    // card holds any more.
+                    if (!location.Channels.Contains(card)) return;
 
-                // Still make sure to join all channels - e.g. when switching back from guard mode
-                foreach (var type in Enum.GetValues<RadioType>())
-                {
-                    var falconChannel = _falconRadioSharedMemoryService.GetRadioChannel(type);
-                    if (falconChannel is not { IsOn: true }) continue;
-                    if (falconChannel.Frequency == 9999) continue; // Skip parking frequency
+                    var oldFrequencyKhz = card.FrequencyKhz;
+                    var wasJoined = _openFreqService.IsFrequencyJoined(oldFrequencyKhz, card.Id);
 
-                    foreach (var channel in FalconLocation.Channels)
+                    await location.ApplySlotStateAsync(card, frequencyKhz, shouldJoin);
+
+                    if (oldFrequencyKhz != frequencyKhz || wasJoined != shouldJoin)
                     {
-                        if (channel.FrequencyKhz == falconChannel.Frequency &&
-                            channel.FrequencyKhz != e.NewFrequencyKhz)
-                        {
-                            _logger.LogDebug($"Loop joining channel: {channel.FrequencyKhz}");
-                            channel.Join();
-                        }
+                        _logger.LogInformation(
+                            "{RadioType}: {OldFrequencyKhz} → {FrequencyKhz} kHz, power {Power}, {Membership}",
+                            radioType, oldFrequencyKhz, frequencyKhz, powerOn ? "on" : "off",
+                            shouldJoin ? "joined" : "not joined");
                     }
+
+                    AuditSlot(radioType, card, frequencyKhz, shouldJoin);
                 }
-
-                return;
-            }
-        }
-
-        // Fallback - for some reason there is no channel on the old frequency, create a new one
-        lock (_channelImportLock)
-        {
-            _logger.LogWarning("OnBmsFrequencyChanged for an unknown frequency : {NewFrequencyKhz}", e.NewFrequencyKhz);
-            var channelIsPowerOn = _falconRadioSharedMemoryService.GetRadioChannel(e.RadioType)?.IsOn ?? false;
-
-            var newChannel = Dispatcher.UIThread.InvokeAsync(() =>
-            {
-                var channel = FalconLocation.CreateChannel(
-                    e.NewFrequencyKhz,
-                    BmsLocationName,
-                    false);
-
-                // Only join if the radio is powered on AND it's not the 9999 parking frequency
-                if (channelIsPowerOn && e.NewFrequencyKhz != IFalconRadioSharedMemoryService.BmsRadioOffFrequency)
+                catch (Exception ex)
                 {
-                    channel.Join();
+                    _logger.LogError(ex, "Failed to tune {RadioType} to {FrequencyKhz} kHz", radioType, frequencyKhz);
                 }
-                else
-                {
-                    channel.Leave();
-                }
-
-                return channel;
-            }).GetAwaiter().GetResult();
-
-            // Only call JoinFrequencyAsync if the radio is powered on and not 9999
-            if (channelIsPowerOn && e.NewFrequencyKhz != IFalconRadioSharedMemoryService.BmsRadioOffFrequency)
-            {
-                JoinFrequencyAsync(newChannel.FrequencyKhz, newChannel.Id, FalconLocation.RadioStationData)
-                    .Wait(TimeSpan.FromMilliseconds(500));
-            }
-
-            switch (e.RadioType)
-            {
-                case RadioType.Radio1:
-                    newChannel.Pan = _settings.BmsRadio1Pan;
-                    break;
-                case RadioType.Radio2:
-                    newChannel.Pan = _settings.BmsRadio2Pan;
-                    break;
-                case RadioType.Guard:
-                    newChannel.Pan = _settings.BmsRadio1Pan;
-                    break;
-            }
+            });
         }
+    }
+
+    /// <summary>
+    /// Checks what a switch actually produced and report any mismatches.
+    /// </summary>
+    private void AuditSlot(RadioType radioType, ChannelCardViewModel card, int frequencyKhz, bool shouldJoin)
+    {
+        int[] expected = shouldJoin ? [frequencyKhz] : [];
+        var joined = _openFreqService.GetJoinedFrequencies(card.Id).Order().ToList();
+
+        if (card.FrequencyKhz == frequencyKhz && joined.SequenceEqual(expected)) return;
+
+        _logger.LogWarning(
+            "{RadioType} out of sync: asked for {FrequencyKhz} kHz {Membership}, " +
+            "card shows {CardFrequencyKhz} kHz, slot holds [{Joined}]",
+            radioType, frequencyKhz, shouldJoin ? "joined" : "not joined",
+            card.FrequencyKhz, string.Join(", ", joined));
     }
 
 
@@ -600,7 +611,7 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
 
         try
         {
-            await _openFreqService.StartTransmissionAsync(msg.FrequencyKhz, msg.ChannelId, msg.MutedRadioChannels);
+            await _openFreqService.StartTransmissionAsync(msg.FrequencyKhz, msg.ChannelId);
         }
         catch (Exception ex)
         {
@@ -614,47 +625,11 @@ public partial class ChannelCardListViewModel : ViewModelBase, IDisposable
 
         try
         {
-            await _openFreqService.StopTransmissionAsync(msg.FrequencyKhz);
+            await _openFreqService.StopTransmissionAsync(msg.ChannelId);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Failed to stop transmission: {ex.Message}");
-        }
-    }
-
-    public async Task JoinFrequencyAsync(int frequencyKhz, Guid slotId, RadioStationData radioStationData)
-    {
-        if (!_openFreqService.IsAuthenticated) return;
-
-        try
-        {
-            await _openFreqService.JoinFrequencyAsync(frequencyKhz, slotId, radioStationData);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to join frequency {frequencyKhz / 1000d:F3}: {ex.Message}");
-        }
-    }
-
-    public async Task LeaveFrequencyAsync(int frequencyKhz, Guid slotId)
-    {
-        if (!_openFreqService.IsAuthenticated) return;
-
-        try
-        {
-            await _openFreqService.LeaveFrequencyAsync(frequencyKhz, slotId);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Failed to leave frequency {frequencyKhz / 1000d:F3}: {ex.Message}");
-        }
-    }
-
-    public async Task LeaveAllChannelsAsync()
-    {
-        foreach (var location in Locations)
-        {
-            await location.LeaveAllChannelsAsync();
         }
     }
 

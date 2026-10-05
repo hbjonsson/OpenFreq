@@ -27,6 +27,7 @@ public static class RadioControlParser
 
     // RadioChannel structure size (12 bytes with padding)
     private const int RADIOCHANNEL_SIZE = 12;
+    private const int OFFSET_CHANNEL_PTT = 8;          // bool, within a RadioChannel
 
     public static ConnectionParameters ParseConnectionParameters(IntPtr baseAddress)
     {
@@ -63,13 +64,13 @@ public static class RadioControlParser
 
         try
         {
-            int offset = OFFSET_RADIOS + ((int)radioType * RADIOCHANNEL_SIZE);
+            int offset = ChannelOffset(radioType);
 
             var channel = new RadioChannel(radioType)
             {
                 Frequency = Marshal.ReadInt32(baseAddress, offset),
                 RxVolume = Marshal.ReadInt32(baseAddress, offset + 4),
-                PttDepressed = Marshal.ReadByte(baseAddress, offset + 8) != 0,
+                PttDepressed = Marshal.ReadByte(baseAddress, offset + OFFSET_CHANNEL_PTT) != 0,
                 IsOn = Marshal.ReadByte(baseAddress, offset + 9) != 0
             };
 
@@ -81,27 +82,12 @@ public static class RadioControlParser
         }
     }
 
-    public static RadioDevice ParseRadioDevice(IntPtr baseAddress, RadioDeviceType deviceType)
-    {
-        if (baseAddress == IntPtr.Zero)
-            return new RadioDevice(deviceType);
-
-        try
-        {
-            int offset = OFFSET_DEVICES + ((int)deviceType * 4);
-
-            var device = new RadioDevice(deviceType)
-            {
-                IntercomVolume = Marshal.ReadInt32(baseAddress, offset)
-            };
-
-            return device;
-        }
-        catch
-        {
-            return new RadioDevice(deviceType);
-        }
-    }
+    /// <summary>
+    /// Reads only a radio's PTT flag, so PTT can be polled faster than the rest of the RCC data.
+    /// </summary>
+    public static bool ParsePttDepressed(IntPtr baseAddress, RadioType radioType) =>
+        baseAddress != IntPtr.Zero &&
+        Marshal.ReadByte(baseAddress, ChannelOffset(radioType) + OFFSET_CHANNEL_PTT) != 0;
 
     public static string ParseLogbookName(IntPtr baseAddress)
     {
@@ -120,6 +106,8 @@ public static class RadioControlParser
             return string.Empty;
         }
     }
+
+    private static int ChannelOffset(RadioType radioType) => OFFSET_RADIOS + ((int)radioType * RADIOCHANNEL_SIZE);
 
     private static string ReadString(IntPtr baseAddress, int offset, int maxLength)
     {

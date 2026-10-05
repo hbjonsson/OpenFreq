@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Net.WebSockets;
 
 namespace OpenFreqServer;
@@ -10,17 +9,17 @@ public class ClientSession(string id, string displayName, WebSocket webSocket, s
     public string Id { get; } = id;
     public WebSocket WebSocket { get; } = webSocket;
     public bool IsAuthenticated { get; set; }
-    public ConcurrentDictionary<int, FrequencyClientStatus> CurrentFrequencies { get; } = new();
     public DateTime LastActivity { get; set; } = DateTime.UtcNow;
     public string? DisplayName { get; set; } = displayName;
     public string Ip { get; set; } = ip;
     public bool Is3d { get; set; }
-    public SemaphoreSlim SendLock { get; } = new(1, 1);
 
-    public enum FrequencyClientStatus
-    {
-        Transmitting, Receiving
-    }
+    /// <summary>
+    /// The game time from this client's latest transmission message. A transmission that ends without a
+    /// stop message (leave, disconnect) is logged with it.
+    /// </summary>
+    public int? LastGameTimeSeconds { get; set; }
+    public SemaphoreSlim SendLock { get; } = new(1, 1);
 
     public void UpdateActivity()
     {

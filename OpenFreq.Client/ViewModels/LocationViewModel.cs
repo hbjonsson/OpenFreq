@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using System.Threading;
@@ -114,12 +113,6 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         _hotkeyService.HotkeyPressed += OnHotkeyPressed;
         _hotkeyService.HotkeyReleased += OnHotkeyReleased;
 
-        // Subscribe to channel updates for binding changes
-        WeakReferenceMessenger.Default.Register<ChannelUpdatedMessage>(this, OnChannelUpdated);
-        WeakReferenceMessenger.Default.Register<ChannelJoinLeaveRequestedMessage>(this, OnChannelJoinLeaveRequested);
-        WeakReferenceMessenger.Default.Register<SquelchEnabledDisabledMessage>(this, OnSquelchEnabledDisabled);
-        WeakReferenceMessenger.Default.Register<ChannelDeleteRequestedMessage>(this, OnChannelDeleteRequested);
-
         // Only update position if valid coordinates provided
         if (latitude != 0 || longitude != 0)
         {
@@ -127,18 +120,60 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         }
     }
 
-    private async void OnChannelJoinLeaveRequested(object recipient, ChannelJoinLeaveRequestedMessage message)
+    // Cards call these on their own location rather than broadcasting, so no other location can act on a card.
+    // Each location joins with its own RadioStationData, so another location's join would put the card at that
+    // location's position.
+    public async Task JoinChannelAsync(ChannelCardViewModel channel)
     {
         if (!_openFreqService.IsAuthenticated) return;
-        if (message.Join)
+        await _openFreqService.JoinFrequencyAsync(channel.FrequencyKhz, channel.Id, RadioStationData);
+    }
+
+    public async Task LeaveChannelAsync(ChannelCardViewModel channel)
+    {
+        if (!_openFreqService.IsAuthenticated) return;
+        await _openFreqService.LeaveFrequencyAsync(channel.FrequencyKhz, channel.Id);
+    }
+
+    /// <summary>
+    /// Puts one BMS radio slot into the state that BMS reports for it: tuned to
+    /// <paramref name="frequencyKhz"/>, and joined or not joined.
+    /// </summary>
+    /// <remarks>
+    /// The leave, the retune and the join all happen inside this one awaited call. The caller runs these
+    /// one at a time per radio slot, so two of them can never interleave and leave the card and the server
+    /// on different frequencies.
+    /// </remarks>
+    public async Task ApplySlotStateAsync(ChannelCardViewModel channel, int frequencyKhz, bool shouldJoin)
+    {
+        if (!_openFreqService.IsAuthenticated) return;
+
+        // Leave by what the slot actually holds, not by what the card shows. A join left behind by an
+        // earlier fault is cleared here, so every switch re-converges the slot.
+        foreach (var joined in _openFreqService.GetJoinedFrequencies(channel.Id))
         {
-            await _openFreqService.JoinFrequencyAsync(message.FrequencyKhz, message.ChannelId,
-                message.RadioStationData);
+            if (joined == frequencyKhz) continue;
+            await _openFreqService.LeaveFrequencyAsync(joined, channel.Id);
         }
-        else
+
+        channel.FrequencyKhz = frequencyKhz;
+
+        if (shouldJoin)
         {
-            await _openFreqService.LeaveFrequencyAsync(message.FrequencyKhz, message.ChannelId);
+            if (!_openFreqService.IsFrequencyJoined(frequencyKhz, channel.Id))
+                await _openFreqService.JoinFrequencyAsync(frequencyKhz, channel.Id, RadioStationData);
+
+            _openFreqService.SetPan(frequencyKhz, channel.Id, channel.Pan);
+            _openFreqService.SetSquelch(frequencyKhz, channel.Id, channel.IsSquelchEnabled);
         }
+        else if (_openFreqService.IsFrequencyJoined(frequencyKhz, channel.Id))
+        {
+            await _openFreqService.LeaveFrequencyAsync(frequencyKhz, channel.Id);
+        }
+
+        channel.ConnectionStatus = _openFreqService.IsFrequencyJoined(frequencyKhz, channel.Id)
+            ? Channel.ChannelConnectionStatus.Connected
+            : Channel.ChannelConnectionStatus.Disconnected;
     }
 
     private void OnAcmiConnectionStatusChanged(object? sender, AcmiConnectionEventArgs e)
@@ -150,7 +185,7 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
     public ChannelCardViewModel CreateChannel(int frequencyKhz, string name, bool isInEditMode = true,
         RadioType? bmsRadioType = null)
     {
-        var channel = new ChannelCardViewModel(_openFreqService, _hotkeyService, name, frequencyKhz, isInEditMode,
+        var channel = new ChannelCardViewModel(_hotkeyService, name, frequencyKhz, isInEditMode,
             RadioStationData, this,
             Settings);
         channel.Name = name;
@@ -158,8 +193,8 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         channel.IsEditing = isInEditMode;
         channel.BmsRadioType = bmsRadioType;
 
-        // 9999 is BMS's "radio off" parking frequency - always ensure it's disconnected
-        if (frequencyKhz == IFalconRadioSharedMemoryService.BmsRadioOffFrequency)
+        // A parking frequency means the radio is off, so the card must never show Connected.
+        if (IFalconRadioSharedMemoryService.IsBmsParkingFrequency(frequencyKhz))
         {
             channel.ConnectionStatus = Channel.ChannelConnectionStatus.Disconnected;
         }
@@ -178,20 +213,19 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         return channel;
     }
 
-    private async void OnChannelUpdated(object recipient, ChannelUpdatedMessage message)
+    // Moves a channel the user just edited from oldFrequencyKhz to the one it now shows.
+    // BMS cards are not editable and take ApplySlotStateAsync instead.
+    public async Task RetuneChannelAsync(ChannelCardViewModel channel, int oldFrequencyKhz)
     {
         if (!_openFreqService.IsAuthenticated) return;
 
-        // Always leave the old frequency first
-        await _openFreqService.LeaveFrequencyAsync(message.OldFrequencyKhz, message.ChannelId);
+        // Read the card before awaiting, since its frequency can change again in the meantime.
+        var newFrequencyKhz = channel.FrequencyKhz;
+        var pan = channel.Pan;
 
-        if (!message.IsBmsChannel)
-        {
-            // For non-BMS channels, immediately join the new frequency
-            await _openFreqService.JoinFrequencyAsync(message.NewFrequencyKhz, message.ChannelId, RadioStationData);
-            _openFreqService.SetPan(message.NewFrequencyKhz, message.ChannelId, message.CurrentPan);
-        }
-        // For BMS channels, the join will be handled by OnBmsFrequencyChanged after checking power state
+        await _openFreqService.LeaveFrequencyAsync(oldFrequencyKhz, channel.Id);
+        await _openFreqService.JoinFrequencyAsync(newFrequencyKhz, channel.Id, RadioStationData);
+        _openFreqService.SetPan(newFrequencyKhz, channel.Id, pan);
     }
 
     private void OnConnectionStateChanged(object? sender, ConnectionStateChangedEventArgs e)
@@ -208,6 +242,7 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
                 foreach (var channel in Channels)
                 {
                     channel.ConnectionStatus = Channel.ChannelConnectionStatus.Disconnected;
+                    channel.ConnectionError = null;
                 }
 
                 AnyChannelTransmitting = false;
@@ -226,16 +261,19 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         // is rebuilding it.
         Dispatcher.UIThread.Post(() =>
         {
-            // If a slotId is specified, update only that channel; otherwise update all channels on the frequency.
-            var targets = (e.SlotId.HasValue
-                ? Channels.Where(c => c.Id == e.SlotId.Value)
-                : Channels.Where(c => c.FrequencyKhz == e.FrequencyKhz)).ToList();
+            // Addressed per slot: only the card that tuned this frequency updates. Cards parked on the
+            // same frequency without having joined it must stay Disconnected — otherwise PTT would
+            // start a transmission for a slot that was never tuned.
+            // The frequency must match too. A late event for a frequency the card has already left
+            // would otherwise show the card as Connected while the slot holds a different frequency.
+            var targets = Channels.Where(c => c.Id == e.SlotId && c.FrequencyKhz == e.FrequencyKhz).ToList();
 
             foreach (var channel in targets)
             {
-                channel.ConnectionStatus = e.FrequencyKhz == IFalconRadioSharedMemoryService.BmsRadioOffFrequency
+                channel.ConnectionStatus = IFalconRadioSharedMemoryService.IsBmsParkingFrequency(e.FrequencyKhz)
                     ? Channel.ChannelConnectionStatus.Disconnected
                     : e.ConnectionStatus;
+                channel.ConnectionError = e.Reason;
             }
         });
     }
@@ -259,28 +297,20 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
     }
 
 
-    private void OnSquelchEnabledDisabled(object recipient, SquelchEnabledDisabledMessage message)
+    public void SetChannelSquelch(ChannelCardViewModel channel)
     {
-        _openFreqService.SetSquelch(message.FrequencyKhz, message.ChannelId, message.SquelchEnabled);
+        _openFreqService.SetSquelch(channel.FrequencyKhz, channel.Id, channel.IsSquelchEnabled);
     }
 
-    private void OnChannelDeleteRequested(object recipient, ChannelDeleteRequestedMessage message)
+    public void RemoveChannel(ChannelCardViewModel channel)
     {
-        var vm = Channels.FirstOrDefault(c => c.Id == message.ChannelId);
-
-        if (vm != null)
+        Dispatcher.UIThread.Post(() =>
         {
-            Dispatcher.UIThread.Post(() =>
-            {
-                Channels.Remove(vm);
-                vm.Dispose();
-            });
-        }
+            Channels.Remove(channel);
+            channel.Dispose();
+        });
 
-        if (_openFreqService.IsAuthenticated)
-        {
-            _openFreqService.LeaveFrequencyAsync(message.FrequencyKhz, message.ChannelId);
-        }
+        LeaveChannelAsync(channel).FireAndForget();
     }
 
     private async void OnHotkeyPressed(object? sender, HotkeyPressedEventArgs e)
@@ -296,10 +326,7 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
                     if (channel != null && channel.ConnectionStatus != Channel.ChannelConnectionStatus.Disconnected &&
                         !channel.IsEditing)
                     {
-                        // mute only the transmitting frequency
-                        var mutedFrequencies = new List<int> { channel.FrequencyKhz };
-                        await _openFreqService.StartTransmissionAsync(channel.FrequencyKhz, channel.Id,
-                            mutedFrequencies);
+                        await _openFreqService.StartTransmissionAsync(channel.FrequencyKhz, channel.Id);
                     }
                 }
                 else if (e.Type == IHotkeyService.HotkeyType.SquelchToggle)
@@ -327,7 +354,7 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
                 var channel = Channels.FirstOrDefault(c => c.Id == channelId);
                 if (channel != null && channel.ConnectionStatus != Channel.ChannelConnectionStatus.Disconnected)
                 {
-                    await _openFreqService.StopTransmissionAsync(channel.FrequencyKhz);
+                    await _openFreqService.StopTransmissionAsync(channel.Id);
                 }
             }
         }
@@ -335,33 +362,6 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         {
             Console.WriteLine($"Error in hotkey release: {ex.Message}");
         }
-    }
-
-    public bool ChangeChannelFrequency(int oldFreqKhz, int newFreqKhz, bool joined)
-    {
-        var oldChannel =
-            Channels.FirstOrDefault(c => c.FrequencyKhz == oldFreqKhz);
-        if (oldChannel == null)
-        {
-            // TODO Log warning
-            return false;
-        }
-
-        oldChannel.FrequencyKhz = newFreqKhz;
-
-        // 9999 is BMS's "radio off" parking frequency - always ensure it's disconnected
-        if (newFreqKhz == IFalconRadioSharedMemoryService.BmsRadioOffFrequency)
-        {
-            oldChannel.ConnectionStatus = Channel.ChannelConnectionStatus.Disconnected;
-        }
-
-        OnChannelUpdated(this,
-            new ChannelUpdatedMessage(oldChannel.Id, oldFreqKhz, newFreqKhz, oldChannel.ConnectionStatus,
-                oldChannel.Pan, true));
-
-        // Note: Join will be handled by OnBmsFrequencyChanged which explicitly joins for non-9999 frequencies
-
-        return true;
     }
 
     public async Task JoinAllChannelsAsync()
@@ -375,12 +375,12 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
 
     public async Task LeaveAllChannelsAsync()
     {
-        foreach (var channel in Channels)
+        // Leave every card, not just those showing Connected. That status lags the join, so a card that
+        // joined a moment ago can still show Disconnected. The service ignores cards that never joined.
+        // Iterate over a copy, since the cards can change while a leave is awaited.
+        foreach (var channel in Channels.ToList())
         {
-            if (channel.ConnectionStatus != Channel.ChannelConnectionStatus.Disconnected)
-            {
-                await _openFreqService.LeaveFrequencyAsync(channel.FrequencyKhz, channel.Id);
-            }
+            await _openFreqService.LeaveFrequencyAsync(channel.FrequencyKhz, channel.Id);
         }
     }
 
@@ -400,10 +400,6 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
         _openFreqService.ConnectionStateChanged -= OnConnectionStateChanged;
         _acmiClientService.ConnectionStatusChanged -= OnAcmiConnectionStatusChanged;
 
-        WeakReferenceMessenger.Default.Unregister<ChannelUpdatedMessage>(this);
-        WeakReferenceMessenger.Default.Unregister<ChannelJoinLeaveRequestedMessage>(this);
-        WeakReferenceMessenger.Default.Unregister<SquelchEnabledDisabledMessage>(this);
-        WeakReferenceMessenger.Default.Unregister<ChannelDeleteRequestedMessage>(this);
         WeakReferenceMessenger.Default.Unregister<StartTransmissionMessage>(this);
         WeakReferenceMessenger.Default.Unregister<StopTransmissionMessage>(this);
     }
@@ -420,11 +416,6 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
     {
         EditMode = false;
         CreateChannel(225000, $"Channel #{Channels.Count + 1}");
-    }
-
-    [RelayCommand]
-    public void JoinAll()
-    {
     }
 
     [RelayCommand]
@@ -616,18 +607,6 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
             new LocationDeleteRequestedMessage(Id));
     }
 
-    public List<int> GetAllFrequenciesOfLocation(Channel.ChannelType? filterChannelType = null)
-    {
-        var query = Channels.AsEnumerable();
-
-        if (filterChannelType is not null)
-            query = query.Where(c => c.Type == filterChannelType);
-
-        return query
-            .Select(c => c.FrequencyKhz)
-            .ToList();
-    }
-
     protected bool Equals(LocationViewModel other)
     {
         return Id.Equals(other.Id);
@@ -666,5 +645,19 @@ public partial class LocationViewModel : ViewModelBase, IDisposable
                 channel.SquelchHotKey = capturedKey;
             }
         }
+    }
+}
+
+internal static class FireAndForgetExtensions
+{
+    /// <summary>
+    /// Lets <paramref name="task"/> run on without the caller waiting, for synchronous callers that can't await it.
+    /// Unlike discarding it with <c>_ = task</c>, a failure isn't lost: it's rethrown on the caller's synchronization
+    /// context (the UI dispatcher), or on the thread pool if there isn't one, and ends the app through the unhandled
+    /// exception handler.
+    /// </summary>
+    public static async void FireAndForget(this Task task)
+    {
+        await task;
     }
 }

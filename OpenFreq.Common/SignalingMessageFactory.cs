@@ -38,7 +38,8 @@ public static class SignalingMessageFactory
         };
     }
 
-    public static SignalingMessage CreateTransmission(int frequencyKhz, bool transmitting, bool is3d)
+    public static SignalingMessage CreateTransmission(int frequencyKhz, bool transmitting, bool is3d,
+        int? gameTimeSeconds = null)
     {
         return new SignalingMessage
         {
@@ -48,13 +49,14 @@ public static class SignalingMessageFactory
                 {
                     FrequencyKhz = frequencyKhz,
                     Transmitting = transmitting,
-                    Is3d = is3d
+                    Is3d = is3d,
+                    GameTimeSeconds = gameTimeSeconds
                 },
                 OpenFreqJsonContext.Default.AudioTransmissionMessage)
         };
     }
 
-    public static SignalingMessage CreateSuccess(string message, SortedDictionary<int, List<PeerData>> peers, string? peerId = null, int? audioPort = null, bool opusEnabled = true)
+    public static SignalingMessage CreateSuccess(string message, SortedDictionary<int, List<PeerData>> peers, string? peerId = null, int? audioPort = null)
     {
         return new SignalingMessage
         {
@@ -65,7 +67,6 @@ public static class SignalingMessageFactory
                     Message = message,
                     PeerId = peerId,
                     AudioPort = audioPort,
-                    OpusCompressionEnabled = opusEnabled,
                     FrequenciesPeers = peers
                 },
                 OpenFreqJsonContext.Default.SuccessMessage)
@@ -125,7 +126,8 @@ public static class SignalingMessageFactory
         };
     }
 
-    public static SignalingMessage CreateTransmissionEvent(string peerId, int frequencyKhz, bool transmitting, bool is3d)
+    public static SignalingMessage CreateTransmissionEvent(string peerId, string peerDisplayName, int frequencyKhz,
+        bool transmitting, bool is3d)
     {
         return new SignalingMessage
         {
@@ -134,6 +136,7 @@ public static class SignalingMessageFactory
                 new TransmissionEventMessage
                 {
                     PeerId = peerId,
+                    PeerDisplayName = peerDisplayName,
                     FrequencyKhz = frequencyKhz,
                     Transmitting = transmitting,
                     Is3d = is3d
